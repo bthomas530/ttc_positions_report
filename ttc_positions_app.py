@@ -279,9 +279,13 @@ def show_update_dialog(update_info):
     
     try:
         # Use JavaScript to show update notification in the web UI
+        # Prepare release notes (escape quotes and newlines)
+        release_notes = update_info.get('release_notes', '')
+        release_notes = release_notes.replace('"', '\\"').replace('\n', ' ')
+        
         js_code = f'''
         if (typeof showUpdateNotification === 'function') {{
-            showUpdateNotification("{update_info['latest_version']}", "{update_info.get('release_notes', '').replace('"', '\\"').replace('\\n', ' ')}");
+            showUpdateNotification("{update_info['latest_version']}", "{release_notes}");
         }} else {{
             if (confirm("A new version ({update_info['latest_version']}) is available!\\n\\nWould you like to update now?")) {{
                 window.location.href = "/api/update/install";
