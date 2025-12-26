@@ -1,0 +1,18 @@
+# TTC Positions Report - Dependencies
+
+# IBKR connection
+ib-insync>=0.9.70
+ib_async>=1.0.3
+
+# Web framework
+Flask>=2.0.1
+waitress>=2.0.0
+
+# Time zones
+pytz>=2021.1
+
+# Native window (optional but recommended)
+pywebview>=4.0
+
+# Build tools (optional - for creating standalone app)
+# pyinstaller>=5.0

@@ -1,0 +1,52 @@
+# Old/archived files
+zOLD/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Build outputs
+build/
+dist/
+Output/
+*.egg-info/
+*.egg
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Logs
+log/
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.code-workspace
+.cursor/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Local config (if contains sensitive data)
+# ttc_watchlist.json
+
+# Generated static files (app recreates these)
+static/
+templates/
+resources/
+
+# Installer output
+installer/*.exe
+installer/*.ico
+installer/*.icns
+
