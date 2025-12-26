@@ -47,8 +47,8 @@ MAX_PORT_TRIES = 10
 
 # GitHub configuration for auto-updates
 # Set these to your repository details
-GITHUB_OWNER = "your-username"  # Change this to your GitHub username
-GITHUB_REPO = "ttc-positions"   # Change this to your repository name
+GITHUB_OWNER = "bthomas530"  # Change this to your GitHub username
+GITHUB_REPO = "ttc_positions_report"   # Change this to your repository name
 GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 
 # Determine directories
