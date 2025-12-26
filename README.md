@@ -119,7 +119,7 @@ git commit -m "Release v2.1.0 - description of changes"
 git tag v2.1.0
 git push origin main --tags
 ```
-
+ 
 GitHub Actions will automatically:
 1. Build the Windows .exe
 2. Build the Mac .app and .dmg
