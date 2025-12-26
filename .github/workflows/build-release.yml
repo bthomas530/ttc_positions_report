@@ -1,0 +1,219 @@
+# TTC Positions Report - Automated Build & Release
+# 
+# This workflow builds Windows and Mac versions automatically when you:
+#   1. Push a tag like v2.0.0, v2.1.0, etc.
+#   2. Or manually trigger from the Actions tab
+#
+# The built installers are uploaded as a GitHub Release.
+
+name: Build and Release
+
+on:
+  # Trigger on version tags
+  push:
+    tags:
+      - 'v*.*.*'
+  
+  # Allow manual trigger from GitHub Actions tab
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version number (e.g., 2.1.0)'
+        required: true
+        default: '2.0.0'
+
+jobs:
+  # ============================================
+  # Build Windows Executable
+  # ============================================
+  build-windows:
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+      
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller --name "TTC Positions Report" `
+            --onefile `
+            --windowed `
+            --hidden-import=ib_async `
+            --hidden-import=webview `
+            --hidden-import=webview.platforms.winforms `
+            --icon=installer/icon.ico `
+            ttc_positions_app.py
+        shell: pwsh
+        continue-on-error: true  # Continue even if icon doesn't exist
+      
+      - name: Build without icon (fallback)
+        if: failure()
+        run: |
+          pyinstaller --name "TTC Positions Report" `
+            --onefile `
+            --windowed `
+            --hidden-import=ib_async `
+            --hidden-import=webview `
+            --hidden-import=webview.platforms.winforms `
+            ttc_positions_app.py
+        shell: pwsh
+      
+      - name: Get version
+        id: version
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            echo "VERSION=${{ github.event.inputs.version }}" >> $env:GITHUB_OUTPUT
+          } else {
+            $tag = "${{ github.ref_name }}"
+            $version = $tag -replace '^v', ''
+            echo "VERSION=$version" >> $env:GITHUB_OUTPUT
+          }
+        shell: pwsh
+      
+      - name: Rename executable
+        run: |
+          $version = "${{ steps.version.outputs.VERSION }}"
+          Move-Item "dist/TTC Positions Report.exe" "dist/TTC_Positions_Report_${version}_Windows.exe"
+        shell: pwsh
+      
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-build
+          path: dist/TTC_Positions_Report_*_Windows.exe
+
+  # ============================================
+  # Build Mac Application
+  # ============================================
+  build-mac:
+    runs-on: macos-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+      
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller --name "TTC Positions Report" \
+            --onedir \
+            --windowed \
+            --hidden-import=ib_async \
+            --hidden-import=webview \
+            --hidden-import=webview.platforms.cocoa \
+            ttc_positions_app.py
+      
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "VERSION=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            VERSION="${{ github.ref_name }}"
+            VERSION="${VERSION#v}"
+            echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Create DMG
+        run: |
+          VERSION="${{ steps.version.outputs.VERSION }}"
+          hdiutil create -volname "TTC Positions Report" \
+            -srcfolder "dist/TTC Positions Report.app" \
+            -ov -format UDZO \
+            "dist/TTC_Positions_Report_${VERSION}_Mac.dmg"
+      
+      - name: Upload Mac artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mac-build
+          path: dist/TTC_Positions_Report_*_Mac.dmg
+
+  # ============================================
+  # Create GitHub Release
+  # ============================================
+  release:
+    needs: [build-windows, build-mac]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "VERSION=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+            echo "TAG=v${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            VERSION="${{ github.ref_name }}"
+            echo "VERSION=${VERSION#v}" >> $GITHUB_OUTPUT
+            echo "TAG=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Download Windows build
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-build
+          path: dist/
+      
+      - name: Download Mac build
+        uses: actions/download-artifact@v4
+        with:
+          name: mac-build
+          path: dist/
+      
+      - name: List files
+        run: ls -la dist/
+      
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version.outputs.TAG }}
+          name: "TTC Positions Report ${{ steps.version.outputs.TAG }}"
+          body: |
+            ## TTC Positions Report ${{ steps.version.outputs.TAG }}
+            
+            ### Downloads
+            - **Windows**: `TTC_Positions_Report_${{ steps.version.outputs.VERSION }}_Windows.exe`
+            - **Mac**: `TTC_Positions_Report_${{ steps.version.outputs.VERSION }}_Mac.dmg`
+            
+            ### Installation
+            - **Windows**: Download and run the .exe file
+            - **Mac**: Download the .dmg, open it, drag to Applications
+            
+            ### What's New
+            See commit history for changes.
+          files: |
+            dist/TTC_Positions_Report_*_Windows.exe
+            dist/TTC_Positions_Report_*_Mac.dmg
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+

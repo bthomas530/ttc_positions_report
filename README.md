@@ -89,7 +89,7 @@ Edit `ttc_positions_app.py` and update these lines (around line 50):
 
 ```python
 GITHUB_OWNER = "YOUR_USERNAME"    # Your GitHub username
-GITHUB_REPO = "ttc-positions"     # Your repository name
+GITHUB_REPO = "YOUR_REPO_NAME"     # Your repository name
 ```
 
 Commit and push this change:
@@ -98,12 +98,48 @@ git add ttc_positions_app.py
 git commit -m "Configure GitHub for auto-updates"
 git push
 ```
-
+ 
 ---
 
 ## Building the App
 
-### Setting Up the Build Environment
+### Option 1: Automated Builds with GitHub Actions (Recommended)
+
+The easiest way to build for both Windows and Mac is to use GitHub Actions. This lets you push code from your Mac and have GitHub automatically build the Windows installer.
+
+**To create a new release:**
+
+```bash
+# 1. Update the version in ttc_positions_app.py
+# 2. Commit your changes
+git add .
+git commit -m "Release v2.1.0 - description of changes"
+
+# 3. Create and push a version tag
+git tag v2.1.0
+git push origin main --tags
+```
+
+GitHub Actions will automatically:
+1. Build the Windows .exe
+2. Build the Mac .app and .dmg
+3. Create a GitHub Release with both files attached
+4. Your dad's app will see the update next time it launches!
+
+**To manually trigger a build:**
+1. Go to your repo on GitHub
+2. Click **Actions** tab
+3. Click **Build and Release** workflow
+4. Click **Run workflow**
+5. Enter version number and click **Run workflow**
+
+---
+
+### Option 2: Local Builds
+
+Use these instructions if you want to build locally on each platform.
+
+#### Setting Up the Build Environment
 
 **Both platforms:**
 ```bash
@@ -127,7 +163,7 @@ pip install pyinstaller
 # Make sure venv is activated
 venv\Scripts\activate
 
-# Build the executable
+# Build the executable (note: ^ is line continuation in Windows batch)
 pyinstaller --name "TTC Positions Report" ^
     --onefile ^
     --windowed ^
@@ -157,9 +193,10 @@ release.bat
 # Make sure venv is activated
 source venv/bin/activate
 
-# Build the app
+# Build the app (note: \ is line continuation in bash/zsh)
+# Use --onedir (not --onefile) for Mac .app bundles
 pyinstaller --name "TTC Positions Report" \
-    --onefile \
+    --onedir \
     --windowed \
     --hidden-import=ib_async \
     --hidden-import=webview \
@@ -261,49 +298,47 @@ APP_VERSION = "2.1.0"  # Increment this
 
 Also update in the HTML (search for `version-badge` and `TTC Positions Report v`).
 
-### Step 2: Build the New Version
+### Step 2: Commit and Tag
 
-**Windows:**
-```batch
-release.bat
+```bash
+git add .
+git commit -m "Release v2.1.0 - description of changes"
+git tag v2.1.0
+git push origin main --tags
 ```
 
-**Mac:**
+### Step 3: GitHub Actions Builds Automatically
+
+Once you push the tag, GitHub Actions will:
+1. ✅ Build Windows .exe (on GitHub's Windows runner)
+2. ✅ Build Mac .dmg (on GitHub's Mac runner)
+3. ✅ Create a GitHub Release with both files attached
+
+You can watch the progress in the **Actions** tab on GitHub.
+
+### Step 4: Users Get the Update
+
+Next time your dad opens the app on Windows:
+1. He'll see a banner: "Update Available! Version 2.1.0 is ready."
+2. He clicks "Update Now"
+3. App downloads and installs automatically
+4. App restarts with new version
+
+---
+
+### Alternative: Manual Release (if GitHub Actions isn't working)
+
+**Option A: Using GitHub CLI**
 ```bash
-./release.sh
-```
-
-### Step 3: Create GitHub Release
-
-**Option A: Using GitHub CLI (recommended)**
-```bash
-# Login first (one-time)
-gh auth login
-
-# Create release
-gh release create v2.1.0 \
-    --title "v2.1.0" \
-    --notes "What's new in this version" \
-    "Output/TTC_Positions_Setup_2.1.0.exe"
+gh auth login  # One-time setup
+gh release create v2.1.0 --title "v2.1.0" --notes "What's new"
 ```
 
 **Option B: Using GitHub Website**
 1. Go to your repo → **Releases** → **Create a new release**
-2. Tag: `v2.1.0`
-3. Title: `v2.1.0`
-4. Description: What's new
-5. **Attach files**:
-   - Windows: `Output/TTC_Positions_Setup_2.1.0.exe`
-   - Mac: `dist/TTC_Positions_Report_2.1.0_Mac.dmg`
-6. Click **Publish release**
-
-### Step 4: Users Get the Update
-
-Next time users open the app:
-1. They'll see a banner: "Update Available! Version 2.1.0 is ready."
-2. They click "Update Now"
-3. App downloads and installs automatically
-4. App restarts with new version
+2. Tag: `v2.1.0`, Title: `v2.1.0`
+3. Build locally and attach files manually
+4. Click **Publish release**
 
 ---
 

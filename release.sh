@@ -78,7 +78,7 @@ rm -rf "$DIST_DIR" "$BUILD_DIR"
 echo -e "${YELLOW}Building application...${NC}"
 pyinstaller \
     --name "$APP_NAME" \
-    --onefile \
+    --onedir \
     --windowed \
     --add-data "resources:resources" \
     --hidden-import="ib_async" \
