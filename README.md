@@ -98,6 +98,32 @@ git add ttc_positions_app.py
 git commit -m "Configure GitHub for auto-updates"
 git push
 ```
+
+### Step 4: Set Up Email Notifications (Optional)
+
+To receive email notifications when a new build is released:
+
+1. Go to your repo → **Settings** → **Secrets and variables** → **Actions**
+2. Click **New repository secret** and add these secrets:
+
+| Secret Name | Value |
+|-------------|-------|
+| `SMTP_USERNAME` | Your Gmail address (e.g., `yourname@gmail.com`) |
+| `SMTP_PASSWORD` | A Gmail App Password (see below) |
+
+**Creating a Gmail App Password:**
+1. Go to [Google Account Security](https://myaccount.google.com/security)
+2. Enable 2-Step Verification if not already enabled
+3. Go to **App passwords** (search for it)
+4. Create a new app password for "Mail"
+5. Copy the 16-character password and use it as `SMTP_PASSWORD`
+
+**To change email recipients:**
+Edit `.github/workflows/build-release.yml` and update:
+```yaml
+env:
+  EMAIL_RECIPIENTS: "email1@example.com,email2@example.com"
+```
  
 ---
 

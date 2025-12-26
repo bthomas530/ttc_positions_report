@@ -5,6 +5,7 @@
 #   2. Or manually trigger from the Actions tab
 #
 # The built installers are uploaded as a GitHub Release.
+# Email notifications are sent to configured recipients.
 
 name: Build and Release
 
@@ -21,6 +22,10 @@ on:
         description: 'Version number (e.g., 2.1.0)'
         required: true
         default: '2.0.0'
+
+env:
+  # Email recipients (comma-separated)
+  EMAIL_RECIPIENTS: "bdt530@gmail.com,rthomas@testing.net"
 
 jobs:
   # ============================================
@@ -45,7 +50,20 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
       
-      - name: Build with PyInstaller
+      - name: Check for icon file
+        id: check_icon
+        run: |
+          if (Test-Path "installer/icon.ico") {
+            echo "ICON_EXISTS=true" >> $env:GITHUB_OUTPUT
+            echo "Icon file found"
+          } else {
+            echo "ICON_EXISTS=false" >> $env:GITHUB_OUTPUT
+            echo "Icon file not found, building without icon"
+          }
+        shell: pwsh
+      
+      - name: Build with PyInstaller (with icon)
+        if: steps.check_icon.outputs.ICON_EXISTS == 'true'
         run: |
           pyinstaller --name "TTC Positions Report" `
             --onefile `
@@ -56,10 +74,9 @@ jobs:
             --icon=installer/icon.ico `
             ttc_positions_app.py
         shell: pwsh
-        continue-on-error: true  # Continue even if icon doesn't exist
       
-      - name: Build without icon (fallback)
-        if: failure()
+      - name: Build with PyInstaller (without icon)
+        if: steps.check_icon.outputs.ICON_EXISTS == 'false'
         run: |
           pyinstaller --name "TTC Positions Report" `
             --onefile `
@@ -192,6 +209,7 @@ jobs:
         run: ls -la dist/
       
       - name: Create Release
+        id: create_release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ steps.version.outputs.TAG }}
@@ -216,4 +234,50 @@ jobs:
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Get Release URL
+        id: release_url
+        run: |
+          echo "RELEASE_URL=https://github.com/${{ github.repository }}/releases/tag/${{ steps.version.outputs.TAG }}" >> $GITHUB_OUTPUT
+
+    outputs:
+      version: ${{ steps.version.outputs.VERSION }}
+      tag: ${{ steps.version.outputs.TAG }}
+      release_url: ${{ steps.release_url.outputs.RELEASE_URL }}
+
+  # ============================================
+  # Send Email Notifications
+  # ============================================
+  notify:
+    needs: release
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Send Email Notification
+        uses: dawidd6/action-send-mail@v3
+        with:
+          # Use GitHub's SMTP or configure your own
+          # For GitHub Actions, you need to set up SMTP secrets
+          server_address: smtp.gmail.com
+          server_port: 587
+          secure: true
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "New Build: TTC Positions Report ${{ needs.release.outputs.tag }}"
+          to: ${{ env.EMAIL_RECIPIENTS }}
+          from: TTC Positions Report <${{ secrets.SMTP_USERNAME }}>
+          body: |
+            A new version of TTC Positions Report has been released!
+            
+            Version: ${{ needs.release.outputs.tag }}
+            
+            Download the latest version here:
+            ${{ needs.release.outputs.release_url }}
+            
+            ---
+            Windows: Download the .exe file and run it
+            Mac: Download the .dmg file, open it, and drag to Applications
+            
+            The app will also notify you of this update when you open it.
+          content_type: text/plain
 
