@@ -41,7 +41,7 @@ except ImportError:
 # Configuration
 # ============================================
 APP_NAME = "TTC Positions Report"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.2"
 DEFAULT_PORT = 8082
 MAX_PORT_TRIES = 10
 
@@ -691,9 +691,13 @@ def index():
 @app.route('/api/data')
 @async_route
 async def get_data():
+    logger.info('API /api/data called - starting data fetch')
     try:
+        logger.info('Fetching IBKR data...')
         ibkr_data = await get_ibkr_data()
+        logger.info('Enhancing with market data...')
         enhanced_data = await enhance_with_market_data(ibkr_data)
+        logger.info(f'Data fetch complete: {len(enhanced_data.get("positions", []))} positions')
         return jsonify(enhanced_data)
     except Exception as e:
         logger.error(f'Error in get_data: {str(e)}', exc_info=True)
@@ -706,6 +710,12 @@ async def get_data():
             'incomplete_lots': [],
             'watchlist': []
         }), 500
+
+@app.route('/api/test')
+def api_test():
+    """Simple test endpoint to verify server is responding"""
+    logger.info('API /api/test called')
+    return jsonify({'status': 'ok', 'message': 'Server is running'})
 
 @app.route('/api/status')
 def get_status():
@@ -807,17 +817,25 @@ def create_native_window(port):
     global webview_window
     
     url = f'http://127.0.0.1:{port}'
+    logger.info(f'Creating native window for URL: {url}')
     time.sleep(1)
     
-    webview_window = webview.create_window(
-        APP_NAME,
-        url,
-        width=1400,
-        height=900,
-        min_size=(800, 600),
-        confirm_close=False,
-        text_select=True
-    )
+    # On Windows, try to use Edge WebView2 for better compatibility
+    # Falls back to other renderers if not available
+    try:
+        webview_window = webview.create_window(
+            APP_NAME,
+            url,
+            width=1400,
+            height=900,
+            min_size=(800, 600),
+            confirm_close=False,
+            text_select=True
+        )
+        logger.info('Native window created successfully')
+    except Exception as e:
+        logger.error(f'Failed to create native window: {e}')
+        raise
     
     def on_closed():
         logger.info('Window closed, initiating shutdown...')
@@ -915,7 +933,7 @@ def create_html_template(path):
             <div class="header-top">
                 <div class="brand">
                     <h1>TTC Positions</h1>
-                    <span class="version-badge">v2.0.0</span>
+                    <span class="version-badge">v2.0.2</span>
                 </div>
                 <div class="header-actions">
                     <div class="market-status" id="marketStatus">
@@ -982,7 +1000,7 @@ def create_html_template(path):
             </section>
         </div>
         <footer class="footer">
-            <span>TTC Positions Report v2.0.0</span>
+            <span>TTC Positions Report v2.0.2</span>
             <span class="footer-sep">|</span>
             <span id="connectionStatus"><i class="fas fa-plug"></i> IBKR</span>
         </footer>
@@ -1003,7 +1021,566 @@ def create_css_file(path):
 
 def create_js_file(path):
     """Create JavaScript file - can be edited without rebuilding!"""
-    js = '''let isRefreshing=!1,currentSort={column:null,direction:"asc"},refreshInterval,cachedData=null,marketStatusInterval;const PREFS_KEY="ttc_positions_prefs";function loadPreferences(){try{return JSON.parse(localStorage.getItem(PREFS_KEY)||"{}")}catch(e){return{}}}function savePreferences(e){try{localStorage.setItem(PREFS_KEY,JSON.stringify({...loadPreferences(),...e}))}catch(e){}}function applyPreferences(){const e=loadPreferences();e.darkMode&&(document.documentElement.setAttribute("data-theme","dark"),document.getElementById("darkModeToggle").innerHTML='<i class="fas fa-sun"></i>'),e.compactView&&document.body.classList.add("compact"),void 0!==e.refreshRate&&(document.getElementById("refreshRate").value=e.refreshRate),e.collapsedSections&&e.collapsedSections.forEach(e=>{const t=document.getElementById(`${e}-section`);t&&t.classList.add("collapsed")})}function showToast(e,t="info",s=3e3){const n=document.getElementById("toast-container"),o=document.createElement("div");o.className=`toast ${t}`;const a={success:"fa-check-circle",error:"fa-exclamation-circle",info:"fa-info-circle"};o.innerHTML=`<i class="fas ${a[t]} toast-icon"></i><span class="toast-message">${e}</span><button class="toast-close" onclick="this.parentElement.remove()"><i class="fas fa-times"></i></button>`,n.appendChild(o),setTimeout(()=>{o.style.animation="slideOut 0.3s ease forwards",setTimeout(()=>o.remove(),300)},s)}function updateMarketStatus(){const e=new Date,t=new Date(e.toLocaleString("en-US",{timeZone:"America/New_York"})),s=t.getDay(),n=t.getHours(),o=t.getMinutes(),a=60*n+o,i=570,c=960,l=document.getElementById("marketStatus"),r=document.getElementById("marketCountdown"),d=l.querySelector(".status-text"),u=0===s||6===s,m=!u&&a>=i&&a<c;if(l.classList.remove("open","closed"),l.classList.add(m?"open":"closed"),m){d.textContent="Market Open";const e=c-a;r.textContent=`Closes in ${Math.floor(e/60)}h ${e%60}m`}else{d.textContent="Market Closed";let e;u?e=(0===s?1:2)*24*60+i-a:a<i?e=i-a:e=1440-a+i;const t=Math.floor(e/60);r.textContent=t>24?`Opens in ${Math.floor(t/24)}d ${t%24}h`:`Opens in ${t}h ${e%60}m`}}function toggleDarkMode(){const e=document.documentElement,t="dark"===e.getAttribute("data-theme");e.setAttribute("data-theme",t?"light":"dark"),document.getElementById("darkModeToggle").innerHTML=t?'<i class="fas fa-moon"></i>':'<i class="fas fa-sun"></i>',savePreferences({darkMode:!t}),showToast(`${t?"Light":"Dark"} mode enabled`,"info",1500)}function toggleCompactView(){const e=document.body.classList.toggle("compact");savePreferences({compactView:e}),showToast(`${e?"Compact":"Normal"} view enabled`,"info",1500)}function toggleSection(e){const t=document.getElementById(`${e}-section`);t.classList.toggle("collapsed");const s=loadPreferences(),n=s.collapsedSections||[];t.classList.contains("collapsed")?n.includes(e)||n.push(e):n.indexOf(e)>-1&&n.splice(n.indexOf(e),1),savePreferences({collapsedSections:n})}function openShortcutsModal(){document.getElementById("shortcuts-modal").classList.add("active")}function closeShortcutsModal(){document.getElementById("shortcuts-modal").classList.remove("active")}function exportToCSV(){if(!cachedData)return void showToast("No data to export","error");let e=["Symbol","Shares","Current Price","Avg Price","Daily Change $","Daily Change %","Last Price","Open","OGap","NP","CC","UC","Shares Available"].join(",")+"\n";cachedData.positions.forEach(t=>{e+=t.map((e,t)=>5===t?(100*e).toFixed(2)+"%":"number"==typeof e?e.toFixed(2):e).join(",")+"\n"});const t=new Blob([e],{type:"text/csv"}),s=document.createElement("a");s.href=URL.createObjectURL(t),s.download=`ttc_positions_${(new Date).toISOString().split("T")[0]}.csv`,s.click(),showToast("Exported to CSV","success")}function formatNumber(e,t){if(""===e||null==e)return"";const s=parseFloat(e);if(isNaN(s))return e;switch(t){case"Current Price":case"Last Price":case"Open":case"Avg Price":return"$"+s.toFixed(2);case"Daily Change $":case"OGap":return(s>=0?"+":"")+"$"+s.toFixed(2);case"Daily Change %":return(s>=0?"+":"")+(100*s).toFixed(2)+"%";default:return s.toLocaleString()}}function createSymbolLink(e){const t=document.createElement("a");return t.href=`https://www.tradingview.com/symbols/${e}/`,t.target="_blank",t.className="symbol-link",t.innerHTML=`${e} <i class="fas fa-external-link-alt external-icon"></i>`,t}function createTable(e,t,s){const n=document.createElement("table"),o=document.createElement("thead"),a=document.createElement("tr");let i=t;"incomplete"===s?i=t.filter(e=>!["NP","CC","UC","Shares Available"].includes(e)):"watchlist"===s&&(i=["Underlying","Current Price","Daily Change $","Daily Change %","Last Price","Open","OGap"]),i.forEach((e,t)=>{const s=document.createElement("th");s.textContent=e,s.classList.add("sortable"),s.addEventListener("click",()=>sortTable(n,t,e)),a.appendChild(s)}),o.appendChild(a),n.appendChild(o);const c=document.createElement("tbody");return e.sort((e,t)=>e[0].toString().toLowerCase().localeCompare(t[0].toString().toLowerCase())),e.forEach(e=>{const n=document.createElement("tr");let o=[...e];"incomplete"===s?o=o.filter((e,s)=>!["NP","CC","UC","Shares Available"].includes(t[s])):"watchlist"===s&&(o=o.slice(0,7)),o.forEach((s,o)=>{const a=document.createElement("td"),c=i[o];"Underlying"===c?a.appendChild(createSymbolLink(s)):"number"==typeof s?(a.textContent=formatNumber(s,c),["Daily Change $","Daily Change %","OGap"].includes(c)?(s>0&&a.classList.add("positive"),s<0&&a.classList.add("negative")):"Current Price"===c?(e[t.indexOf("Daily Change $")]>0&&a.classList.add("positive"),e[t.indexOf("Daily Change $")]<0&&a.classList.add("negative")):"Shares"===c&&0===s?a.classList.add("zero-shares"):"NP"===c&&s>0?a.classList.add("naked-puts"):"CC"===c&&s>0?a.classList.add("covered-calls"):"UC"===c&&s>0?a.classList.add("uncovered-calls"):"Shares Available"===c&&(s>0&&a.classList.add("shares-available"),s<0&&a.classList.add("shares-negative"))):a.textContent=s,n.appendChild(a)}),c.appendChild(n)}),n.appendChild(c),n}function sortTable(e,t){const s=e.querySelector("tbody"),n=Array.from(s.querySelectorAll("tr")),o=e.querySelector(`th:nth-child(${t+1})`);e.querySelectorAll("th").forEach(e=>e.classList.remove("asc","desc"));let a="asc";currentSort.column===t&&(a="asc"===currentSort.direction?"desc":"asc"),currentSort={column:t,direction:a},o.classList.add(a),n.sort((e,s)=>{const n=getCellValue(e,t),o=getCellValue(s,t);return isNaN(parseFloat(n))||isNaN(parseFloat(o))?"asc"===a?n.localeCompare(o):o.localeCompare(n):"asc"===a?parseFloat(n)-parseFloat(o):parseFloat(o)-parseFloat(n)}),n.forEach(e=>s.appendChild(e))}function getCellValue(e,t){const s=e.querySelector(`td:nth-child(${t+1})`);return s?s.textContent.trim().replace(/[$%+,]/g,""):""}function filterTables(e){document.querySelectorAll("table").forEach(t=>{const s=t.querySelectorAll("tbody tr");let n=!1;s.forEach(t=>{(t.querySelector("td:first-child")?.textContent||"").match(new RegExp(e,"i"))?(t.classList.remove("hidden"),n=!0):t.classList.add("hidden")});let o=t.parentElement.querySelector(".no-results");n||0===s.length?o&&(o.style.display="none"):(o||(o=document.createElement("div"),o.className="no-results",o.textContent="No matching symbols found",t.parentElement.appendChild(o)),o.style.display="block")})}function clearSearch(){const e=document.getElementById("searchInput");e.value="",filterTables(""),e.focus()}function updateSummaryStats(e){document.getElementById("statPositions").textContent=e.positions.length,document.getElementById("statWatchlist").textContent=e.watchlist.length;let t=0,s=0,n=0;e.positions.forEach(e=>{const o=e[4];o>0&&t++,o<0&&s++,n+=o*e[1]}),document.getElementById("statGainers").textContent=t,document.getElementById("statLosers").textContent=s;const o=document.getElementById("statDailyPL");o.textContent=(n>=0?"+":"")+"$"+n.toFixed(2),o.className="stat-value "+(n>=0?"positive":"negative")}function updateSectionCounts(e){document.getElementById("positions-count").textContent=e.positions.length,document.getElementById("incomplete-count").textContent=e.incomplete_lots.length,document.getElementById("watchlist-count").textContent=e.watchlist.length}function updateLastUpdateTime(){document.getElementById("lastUpdate").innerHTML=`<i class="far fa-clock"></i> <span>Updated at ${(new Date).toLocaleTimeString()}</span>`}function setLoadingState(e){const t=document.querySelector(".refresh-icon");e?t.classList.add("refreshing"):t.classList.remove("refreshing")}async function updateTables(){if(isRefreshing)return;isRefreshing=!0,setLoadingState(!0);try{const e=await fetch("/api/data");if(!e.ok)throw new Error((await e.json()).error||"Server error");const t=await e.json();cachedData=t;const s=["Underlying","Shares","Current Price","Avg Price","Daily Change $","Daily Change %","Last Price","Open","OGap","NP","CC","UC","Shares Available"],n=document.getElementById("positions-table"),o=document.getElementById("incomplete-table"),a=document.getElementById("watchlist-table");n.innerHTML=t.positions.length>0?"":'<div class="no-results">No positions found</div>',o.innerHTML=t.incomplete_lots.length>0?"":'<div class="no-results">No incomplete lots</div>',a.innerHTML=t.watchlist.length>0?"":'<div class="no-results">No watchlist items</div>',t.positions.length>0&&n.appendChild(createTable(t.positions,s,"positions")),t.incomplete_lots.length>0&&o.appendChild(createTable(t.incomplete_lots,s,"incomplete")),t.watchlist.length>0&&a.appendChild(createTable(t.watchlist,s,"watchlist")),updateLastUpdateTime(),updateSummaryStats(t),updateSectionCounts(t);const i=document.getElementById("searchInput").value;i&&filterTables(i),document.getElementById("connectionStatus").className="connected",document.getElementById("connectionStatus").innerHTML='<i class="fas fa-plug"></i> IBKR Connected',showToast("Data refreshed","success",1500)}catch(e){console.error("Error:",e),showToast(e.message,"error"),document.getElementById("connectionStatus").className="disconnected",document.getElementById("connectionStatus").innerHTML='<i class="fas fa-plug"></i> Connection Error'}finally{isRefreshing=!1,setLoadingState(!1)}}function setRefreshRate(e){refreshInterval&&clearInterval(refreshInterval),e>0&&(refreshInterval=setInterval(updateTables,1e3*e)),savePreferences({refreshRate:e})}document.addEventListener("keydown",e=>{if("INPUT"===e.target.tagName||"TEXTAREA"===e.target.tagName)return void("Escape"===e.key&&(clearSearch(),e.target.blur()));switch(e.key.toLowerCase()){case"r":e.preventDefault(),updateTables();break;case"/":e.preventDefault(),document.getElementById("searchInput").focus();break;case"d":e.preventDefault(),toggleDarkMode();break;case"c":e.preventDefault(),toggleCompactView();break;case"e":e.preventDefault(),exportToCSV();break;case"?":e.preventDefault(),openShortcutsModal();break;case"escape":closeShortcutsModal()}}),document.addEventListener("DOMContentLoaded",()=>{applyPreferences(),document.getElementById("darkModeToggle").addEventListener("click",toggleDarkMode),document.getElementById("compactToggle").addEventListener("click",toggleCompactView),document.getElementById("exportBtn").addEventListener("click",exportToCSV),document.getElementById("shortcutsBtn").addEventListener("click",openShortcutsModal),document.getElementById("refreshButton").addEventListener("click",updateTables),document.getElementById("refreshRate").addEventListener("change",e=>setRefreshRate(parseInt(e.target.value))),document.getElementById("searchInput").addEventListener("input",e=>filterTables(e.target.value)),document.getElementById("clearSearch").addEventListener("click",clearSearch),document.getElementById("shortcuts-modal").addEventListener("click",e=>{e.target===document.getElementById("shortcuts-modal")&&closeShortcutsModal()}),updateMarketStatus(),marketStatusInterval=setInterval(updateMarketStatus,6e4),updateTables(),setRefreshRate(parseInt(document.getElementById("refreshRate").value)),checkForUpdates()});function showUpdateNotification(e,t){const n=document.createElement("div");n.id="update-banner",n.style.cssText="position:fixed;top:0;left:0;right:0;background:linear-gradient(135deg,#3b82f6,#8b5cf6);color:white;padding:12px 20px;display:flex;align-items:center;justify-content:center;gap:16px;z-index:10001;font-family:var(--font-sans);box-shadow:0 4px 12px rgba(0,0,0,0.15);",n.innerHTML=`<i class="fas fa-gift" style="font-size:20px"></i><span><strong>Update Available!</strong> Version ${e} is ready.</span><button onclick="installUpdate()" style="background:white;color:#3b82f6;border:none;padding:8px 16px;border-radius:6px;font-weight:600;cursor:pointer">Update Now</button><button onclick="dismissUpdate()" style="background:transparent;color:white;border:1px solid rgba(255,255,255,0.5);padding:8px 12px;border-radius:6px;cursor:pointer">Later</button>`,document.body.prepend(n),document.querySelector(".container").style.marginTop="60px"}function dismissUpdate(){const e=document.getElementById("update-banner");e&&e.remove(),document.querySelector(".container").style.marginTop=""}async function installUpdate(){showToast("Downloading update...","info",5e3);try{const e=await fetch("/api/update/download"),t=await e.json();t.success?showToast("Installing update... The app will restart.","success",1e4):showToast("Update failed: "+t.error,"error")}catch(e){showToast("Update failed: "+e.message,"error")}}async function checkForUpdates(){try{const e=await fetch("/api/update/check"),t=await e.json();t.available&&showUpdateNotification(t.latest_version,t.release_notes||"")}catch(e){console.log("Could not check for updates:",e)}}'''
+    # Using readable JS for debugging - will help identify issues
+    js = '''
+// TTC Positions Report - Frontend JavaScript
+// Version 2.0.2
+
+let isRefreshing = false;
+let currentSort = { column: null, direction: "asc" };
+let refreshInterval;
+let cachedData = null;
+let marketStatusInterval;
+const PREFS_KEY = "ttc_positions_prefs";
+
+// Debug logging
+function log(msg) {
+    console.log("[TTC] " + msg);
+}
+
+function loadPreferences() {
+    try {
+        return JSON.parse(localStorage.getItem(PREFS_KEY) || "{}");
+    } catch (e) {
+        return {};
+    }
+}
+
+function savePreferences(prefs) {
+    try {
+        localStorage.setItem(PREFS_KEY, JSON.stringify({ ...loadPreferences(), ...prefs }));
+    } catch (e) {
+        log("Failed to save preferences: " + e);
+    }
+}
+
+function applyPreferences() {
+    const prefs = loadPreferences();
+    if (prefs.darkMode) {
+        document.documentElement.setAttribute("data-theme", "dark");
+        document.getElementById("darkModeToggle").innerHTML = '<i class="fas fa-sun"></i>';
+    }
+    if (prefs.compactView) {
+        document.body.classList.add("compact");
+    }
+    if (prefs.refreshRate !== undefined) {
+        document.getElementById("refreshRate").value = prefs.refreshRate;
+    }
+    if (prefs.collapsedSections) {
+        prefs.collapsedSections.forEach(section => {
+            const el = document.getElementById(section + "-section");
+            if (el) el.classList.add("collapsed");
+        });
+    }
+}
+
+function showToast(message, type = "info", duration = 3000) {
+    const container = document.getElementById("toast-container");
+    const toast = document.createElement("div");
+    toast.className = "toast " + type;
+    const icons = { success: "fa-check-circle", error: "fa-exclamation-circle", info: "fa-info-circle" };
+    toast.innerHTML = '<i class="fas ' + icons[type] + ' toast-icon"></i><span class="toast-message">' + message + '</span><button class="toast-close" onclick="this.parentElement.remove()"><i class="fas fa-times"></i></button>';
+    container.appendChild(toast);
+    setTimeout(() => {
+        toast.style.animation = "slideOut 0.3s ease forwards";
+        setTimeout(() => toast.remove(), 300);
+    }, duration);
+}
+
+function updateMarketStatus() {
+    const now = new Date();
+    const eastern = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
+    const day = eastern.getDay();
+    const hours = eastern.getHours();
+    const minutes = eastern.getMinutes();
+    const totalMinutes = hours * 60 + minutes;
+    const marketOpen = 570; // 9:30 AM
+    const marketClose = 960; // 4:00 PM
+    
+    const statusEl = document.getElementById("marketStatus");
+    const countdownEl = document.getElementById("marketCountdown");
+    const textEl = statusEl.querySelector(".status-text");
+    
+    const isWeekend = day === 0 || day === 6;
+    const isOpen = !isWeekend && totalMinutes >= marketOpen && totalMinutes < marketClose;
+    
+    statusEl.classList.remove("open", "closed");
+    statusEl.classList.add(isOpen ? "open" : "closed");
+    
+    if (isOpen) {
+        textEl.textContent = "Market Open";
+        const remaining = marketClose - totalMinutes;
+        countdownEl.textContent = "Closes in " + Math.floor(remaining / 60) + "h " + (remaining % 60) + "m";
+    } else {
+        textEl.textContent = "Market Closed";
+        let minutesUntilOpen;
+        if (isWeekend) {
+            minutesUntilOpen = (day === 0 ? 1 : 2) * 24 * 60 + marketOpen - totalMinutes;
+        } else if (totalMinutes < marketOpen) {
+            minutesUntilOpen = marketOpen - totalMinutes;
+        } else {
+            minutesUntilOpen = 1440 - totalMinutes + marketOpen;
+        }
+        const hoursUntil = Math.floor(minutesUntilOpen / 60);
+        countdownEl.textContent = hoursUntil > 24 
+            ? "Opens in " + Math.floor(hoursUntil / 24) + "d " + (hoursUntil % 24) + "h"
+            : "Opens in " + hoursUntil + "h " + (minutesUntilOpen % 60) + "m";
+    }
+}
+
+function toggleDarkMode() {
+    const html = document.documentElement;
+    const isDark = html.getAttribute("data-theme") === "dark";
+    html.setAttribute("data-theme", isDark ? "light" : "dark");
+    document.getElementById("darkModeToggle").innerHTML = isDark ? '<i class="fas fa-moon"></i>' : '<i class="fas fa-sun"></i>';
+    savePreferences({ darkMode: !isDark });
+    showToast((isDark ? "Light" : "Dark") + " mode enabled", "info", 1500);
+}
+
+function toggleCompactView() {
+    const isCompact = document.body.classList.toggle("compact");
+    savePreferences({ compactView: isCompact });
+    showToast((isCompact ? "Compact" : "Normal") + " view enabled", "info", 1500);
+}
+
+function toggleSection(section) {
+    const el = document.getElementById(section + "-section");
+    el.classList.toggle("collapsed");
+    const prefs = loadPreferences();
+    const collapsed = prefs.collapsedSections || [];
+    if (el.classList.contains("collapsed")) {
+        if (!collapsed.includes(section)) collapsed.push(section);
+    } else {
+        const idx = collapsed.indexOf(section);
+        if (idx > -1) collapsed.splice(idx, 1);
+    }
+    savePreferences({ collapsedSections: collapsed });
+}
+
+function openShortcutsModal() {
+    document.getElementById("shortcuts-modal").classList.add("active");
+}
+
+function closeShortcutsModal() {
+    document.getElementById("shortcuts-modal").classList.remove("active");
+}
+
+function exportToCSV() {
+    if (!cachedData) {
+        showToast("No data to export", "error");
+        return;
+    }
+    let csv = ["Symbol","Shares","Current Price","Avg Price","Daily Change $","Daily Change %","Last Price","Open","OGap","NP","CC","UC","Shares Available"].join(",") + "\\n";
+    cachedData.positions.forEach(row => {
+        csv += row.map((val, i) => i === 5 ? (val * 100).toFixed(2) + "%" : (typeof val === "number" ? val.toFixed(2) : val)).join(",") + "\\n";
+    });
+    const blob = new Blob([csv], { type: "text/csv" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "ttc_positions_" + new Date().toISOString().split("T")[0] + ".csv";
+    a.click();
+    showToast("Exported to CSV", "success");
+}
+
+function formatNumber(value, column) {
+    if (value === "" || value === null || value === undefined) return "";
+    const num = parseFloat(value);
+    if (isNaN(num)) return value;
+    switch (column) {
+        case "Current Price":
+        case "Last Price":
+        case "Open":
+        case "Avg Price":
+            return "$" + num.toFixed(2);
+        case "Daily Change $":
+        case "OGap":
+            return (num >= 0 ? "+" : "") + "$" + num.toFixed(2);
+        case "Daily Change %":
+            return (num >= 0 ? "+" : "") + (num * 100).toFixed(2) + "%";
+        default:
+            return num.toLocaleString();
+    }
+}
+
+function createSymbolLink(symbol) {
+    const a = document.createElement("a");
+    a.href = "https://www.tradingview.com/symbols/" + symbol + "/";
+    a.target = "_blank";
+    a.className = "symbol-link";
+    a.innerHTML = symbol + ' <i class="fas fa-external-link-alt external-icon"></i>';
+    return a;
+}
+
+function createTable(data, headers, section) {
+    const table = document.createElement("table");
+    const thead = document.createElement("thead");
+    const headerRow = document.createElement("tr");
+    
+    let sectionHeaders = headers;
+    if (section === "incomplete") {
+        sectionHeaders = headers.filter(h => !["NP", "CC", "UC", "Shares Available"].includes(h));
+    } else if (section === "watchlist") {
+        sectionHeaders = ["Underlying", "Current Price", "Daily Change $", "Daily Change %", "Last Price", "Open", "OGap"];
+    }
+    
+    sectionHeaders.forEach((header, idx) => {
+        const th = document.createElement("th");
+        th.textContent = header;
+        th.classList.add("sortable");
+        th.addEventListener("click", () => sortTable(table, idx, header));
+        headerRow.appendChild(th);
+    });
+    thead.appendChild(headerRow);
+    table.appendChild(thead);
+    
+    const tbody = document.createElement("tbody");
+    data.sort((a, b) => a[0].toString().toLowerCase().localeCompare(b[0].toString().toLowerCase()));
+    
+    data.forEach(row => {
+        const tr = document.createElement("tr");
+        let rowData = [...row];
+        if (section === "incomplete") {
+            rowData = rowData.filter((_, i) => !["NP", "CC", "UC", "Shares Available"].includes(headers[i]));
+        } else if (section === "watchlist") {
+            rowData = rowData.slice(0, 7);
+        }
+        
+        rowData.forEach((cell, idx) => {
+            const td = document.createElement("td");
+            const header = sectionHeaders[idx];
+            
+            if (header === "Underlying") {
+                td.appendChild(createSymbolLink(cell));
+            } else if (typeof cell === "number") {
+                td.textContent = formatNumber(cell, header);
+                if (["Daily Change $", "Daily Change %", "OGap"].includes(header)) {
+                    if (cell > 0) td.classList.add("positive");
+                    if (cell < 0) td.classList.add("negative");
+                } else if (header === "Current Price") {
+                    const changeIdx = headers.indexOf("Daily Change $");
+                    if (row[changeIdx] > 0) td.classList.add("positive");
+                    if (row[changeIdx] < 0) td.classList.add("negative");
+                } else if (header === "Shares" && cell === 0) {
+                    td.classList.add("zero-shares");
+                } else if (header === "NP" && cell > 0) {
+                    td.classList.add("naked-puts");
+                } else if (header === "CC" && cell > 0) {
+                    td.classList.add("covered-calls");
+                } else if (header === "UC" && cell > 0) {
+                    td.classList.add("uncovered-calls");
+                } else if (header === "Shares Available") {
+                    if (cell > 0) td.classList.add("shares-available");
+                    if (cell < 0) td.classList.add("shares-negative");
+                }
+            } else {
+                td.textContent = cell;
+            }
+            tr.appendChild(td);
+        });
+        tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    return table;
+}
+
+function sortTable(table, colIndex) {
+    const tbody = table.querySelector("tbody");
+    const rows = Array.from(tbody.querySelectorAll("tr"));
+    const th = table.querySelector("th:nth-child(" + (colIndex + 1) + ")");
+    
+    table.querySelectorAll("th").forEach(h => h.classList.remove("asc", "desc"));
+    
+    let dir = "asc";
+    if (currentSort.column === colIndex) {
+        dir = currentSort.direction === "asc" ? "desc" : "asc";
+    }
+    currentSort = { column: colIndex, direction: dir };
+    th.classList.add(dir);
+    
+    rows.sort((a, b) => {
+        const aVal = getCellValue(a, colIndex);
+        const bVal = getCellValue(b, colIndex);
+        if (isNaN(parseFloat(aVal)) || isNaN(parseFloat(bVal))) {
+            return dir === "asc" ? aVal.localeCompare(bVal) : bVal.localeCompare(aVal);
+        }
+        return dir === "asc" ? parseFloat(aVal) - parseFloat(bVal) : parseFloat(bVal) - parseFloat(aVal);
+    });
+    
+    rows.forEach(row => tbody.appendChild(row));
+}
+
+function getCellValue(row, index) {
+    const cell = row.querySelector("td:nth-child(" + (index + 1) + ")");
+    return cell ? cell.textContent.trim().replace(/[$%+,]/g, "") : "";
+}
+
+function filterTables(searchText) {
+    document.querySelectorAll("table").forEach(table => {
+        const rows = table.querySelectorAll("tbody tr");
+        let hasVisible = false;
+        
+        rows.forEach(row => {
+            const symbol = row.querySelector("td:first-child")?.textContent || "";
+            if (symbol.match(new RegExp(searchText, "i"))) {
+                row.classList.remove("hidden");
+                hasVisible = true;
+            } else {
+                row.classList.add("hidden");
+            }
+        });
+        
+        let noResults = table.parentElement.querySelector(".no-results");
+        if (hasVisible || rows.length === 0) {
+            if (noResults) noResults.style.display = "none";
+        } else {
+            if (!noResults) {
+                noResults = document.createElement("div");
+                noResults.className = "no-results";
+                noResults.textContent = "No matching symbols found";
+                table.parentElement.appendChild(noResults);
+            }
+            noResults.style.display = "block";
+        }
+    });
+}
+
+function clearSearch() {
+    const input = document.getElementById("searchInput");
+    input.value = "";
+    filterTables("");
+    input.focus();
+}
+
+function updateSummaryStats(data) {
+    document.getElementById("statPositions").textContent = data.positions.length;
+    document.getElementById("statWatchlist").textContent = data.watchlist.length;
+    
+    let gainers = 0, losers = 0, dailyPL = 0;
+    data.positions.forEach(pos => {
+        const change = pos[4];
+        if (change > 0) gainers++;
+        if (change < 0) losers++;
+        dailyPL += change * pos[1];
+    });
+    
+    document.getElementById("statGainers").textContent = gainers;
+    document.getElementById("statLosers").textContent = losers;
+    
+    const plEl = document.getElementById("statDailyPL");
+    plEl.textContent = (dailyPL >= 0 ? "+" : "") + "$" + dailyPL.toFixed(2);
+    plEl.className = "stat-value " + (dailyPL >= 0 ? "positive" : "negative");
+}
+
+function updateSectionCounts(data) {
+    document.getElementById("positions-count").textContent = data.positions.length;
+    document.getElementById("incomplete-count").textContent = data.incomplete_lots.length;
+    document.getElementById("watchlist-count").textContent = data.watchlist.length;
+}
+
+function updateLastUpdateTime() {
+    document.getElementById("lastUpdate").innerHTML = '<i class="far fa-clock"></i> <span>Updated at ' + new Date().toLocaleTimeString() + '</span>';
+}
+
+function setLoadingState(loading) {
+    const icon = document.querySelector(".refresh-icon");
+    if (loading) {
+        icon.classList.add("refreshing");
+    } else {
+        icon.classList.remove("refreshing");
+    }
+}
+
+async function updateTables() {
+    log("updateTables called");
+    if (isRefreshing) {
+        log("Already refreshing, skipping");
+        return;
+    }
+    
+    isRefreshing = true;
+    setLoadingState(true);
+    log("Starting data fetch...");
+    
+    try {
+        log("Fetching /api/data...");
+        const response = await fetch("/api/data");
+        log("Response status: " + response.status);
+        
+        if (!response.ok) {
+            const errData = await response.json();
+            throw new Error(errData.error || "Server error");
+        }
+        
+        const data = await response.json();
+        log("Data received: " + data.positions.length + " positions");
+        cachedData = data;
+        
+        const headers = ["Underlying", "Shares", "Current Price", "Avg Price", "Daily Change $", "Daily Change %", "Last Price", "Open", "OGap", "NP", "CC", "UC", "Shares Available"];
+        
+        const positionsTable = document.getElementById("positions-table");
+        const incompleteTable = document.getElementById("incomplete-table");
+        const watchlistTable = document.getElementById("watchlist-table");
+        
+        positionsTable.innerHTML = data.positions.length > 0 ? "" : '<div class="no-results">No positions found</div>';
+        incompleteTable.innerHTML = data.incomplete_lots.length > 0 ? "" : '<div class="no-results">No incomplete lots</div>';
+        watchlistTable.innerHTML = data.watchlist.length > 0 ? "" : '<div class="no-results">No watchlist items</div>';
+        
+        if (data.positions.length > 0) positionsTable.appendChild(createTable(data.positions, headers, "positions"));
+        if (data.incomplete_lots.length > 0) incompleteTable.appendChild(createTable(data.incomplete_lots, headers, "incomplete"));
+        if (data.watchlist.length > 0) watchlistTable.appendChild(createTable(data.watchlist, headers, "watchlist"));
+        
+        updateLastUpdateTime();
+        updateSummaryStats(data);
+        updateSectionCounts(data);
+        
+        const searchVal = document.getElementById("searchInput").value;
+        if (searchVal) filterTables(searchVal);
+        
+        document.getElementById("connectionStatus").className = "connected";
+        document.getElementById("connectionStatus").innerHTML = '<i class="fas fa-plug"></i> IBKR Connected';
+        showToast("Data refreshed", "success", 1500);
+        
+    } catch (error) {
+        log("Error: " + error.message);
+        console.error("Fetch error:", error);
+        showToast(error.message, "error");
+        document.getElementById("connectionStatus").className = "disconnected";
+        document.getElementById("connectionStatus").innerHTML = '<i class="fas fa-plug"></i> Connection Error';
+    } finally {
+        isRefreshing = false;
+        setLoadingState(false);
+    }
+}
+
+function setRefreshRate(seconds) {
+    if (refreshInterval) clearInterval(refreshInterval);
+    if (seconds > 0) {
+        refreshInterval = setInterval(updateTables, seconds * 1000);
+    }
+    savePreferences({ refreshRate: seconds });
+}
+
+// Keyboard shortcuts
+document.addEventListener("keydown", (e) => {
+    if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") {
+        if (e.key === "Escape") {
+            clearSearch();
+            e.target.blur();
+        }
+        return;
+    }
+    
+    switch (e.key.toLowerCase()) {
+        case "r":
+            e.preventDefault();
+            updateTables();
+            break;
+        case "/":
+            e.preventDefault();
+            document.getElementById("searchInput").focus();
+            break;
+        case "d":
+            e.preventDefault();
+            toggleDarkMode();
+            break;
+        case "c":
+            e.preventDefault();
+            toggleCompactView();
+            break;
+        case "e":
+            e.preventDefault();
+            exportToCSV();
+            break;
+        case "?":
+            e.preventDefault();
+            openShortcutsModal();
+            break;
+        case "escape":
+            closeShortcutsModal();
+            break;
+    }
+});
+
+// Initialize on DOM ready
+document.addEventListener("DOMContentLoaded", () => {
+    log("DOM loaded, initializing...");
+    
+    applyPreferences();
+    
+    document.getElementById("darkModeToggle").addEventListener("click", toggleDarkMode);
+    document.getElementById("compactToggle").addEventListener("click", toggleCompactView);
+    document.getElementById("exportBtn").addEventListener("click", exportToCSV);
+    document.getElementById("shortcutsBtn").addEventListener("click", openShortcutsModal);
+    document.getElementById("refreshButton").addEventListener("click", () => {
+        log("Refresh button clicked");
+        updateTables();
+    });
+    document.getElementById("refreshRate").addEventListener("change", (e) => setRefreshRate(parseInt(e.target.value)));
+    document.getElementById("searchInput").addEventListener("input", (e) => filterTables(e.target.value));
+    document.getElementById("clearSearch").addEventListener("click", clearSearch);
+    document.getElementById("shortcuts-modal").addEventListener("click", (e) => {
+        if (e.target === document.getElementById("shortcuts-modal")) closeShortcutsModal();
+    });
+    
+    updateMarketStatus();
+    marketStatusInterval = setInterval(updateMarketStatus, 60000);
+    
+    log("Calling initial updateTables...");
+    updateTables();
+    
+    setRefreshRate(parseInt(document.getElementById("refreshRate").value));
+    
+    // Check for updates after a delay
+    setTimeout(checkForUpdates, 2000);
+});
+
+// Update notification functions
+function showUpdateNotification(version, notes) {
+    const banner = document.createElement("div");
+    banner.id = "update-banner";
+    banner.style.cssText = "position:fixed;top:0;left:0;right:0;background:linear-gradient(135deg,#3b82f6,#8b5cf6);color:white;padding:12px 20px;display:flex;align-items:center;justify-content:center;gap:16px;z-index:10001;font-family:var(--font-sans);box-shadow:0 4px 12px rgba(0,0,0,0.15);";
+    banner.innerHTML = '<i class="fas fa-gift" style="font-size:20px"></i><span><strong>Update Available!</strong> Version ' + version + ' is ready.</span><button onclick="installUpdate()" style="background:white;color:#3b82f6;border:none;padding:8px 16px;border-radius:6px;font-weight:600;cursor:pointer">Update Now</button><button onclick="dismissUpdate()" style="background:transparent;color:white;border:1px solid rgba(255,255,255,0.5);padding:8px 12px;border-radius:6px;cursor:pointer">Later</button>';
+    document.body.prepend(banner);
+    document.querySelector(".container").style.marginTop = "60px";
+}
+
+function dismissUpdate() {
+    const banner = document.getElementById("update-banner");
+    if (banner) banner.remove();
+    document.querySelector(".container").style.marginTop = "";
+}
+
+async function installUpdate() {
+    showToast("Downloading update...", "info", 5000);
+    try {
+        const response = await fetch("/api/update/download");
+        const result = await response.json();
+        if (result.success) {
+            showToast("Installing update... The app will restart.", "success", 10000);
+        } else {
+            showToast("Update failed: " + result.error, "error");
+        }
+    } catch (error) {
+        showToast("Update failed: " + error.message, "error");
+    }
+}
+
+async function checkForUpdates() {
+    try {
+        log("Checking for updates...");
+        const response = await fetch("/api/update/check");
+        const result = await response.json();
+        if (result.available) {
+            log("Update available: " + result.latest_version);
+            showUpdateNotification(result.latest_version, result.release_notes || "");
+        } else {
+            log("No updates available");
+        }
+    } catch (error) {
+        log("Could not check for updates: " + error);
+    }
+}
+'''
     with open(path, 'w', encoding='utf-8') as f:
         f.write(js)
     logger.info(f'Created: {path}')

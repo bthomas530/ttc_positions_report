@@ -256,10 +256,8 @@ jobs:
       - name: Send Email Notification
         uses: dawidd6/action-send-mail@v3
         with:
-          # Use GitHub's SMTP or configure your own
-          # For GitHub Actions, you need to set up SMTP secrets
           server_address: smtp.gmail.com
-          server_port: 587
+          server_port: 465
           secure: true
           username: ${{ secrets.SMTP_USERNAME }}
           password: ${{ secrets.SMTP_PASSWORD }}
@@ -279,5 +277,4 @@ jobs:
             Mac: Download the .dmg file, open it, and drag to Applications
             
             The app will also notify you of this update when you open it.
-          content_type: text/plain
 
