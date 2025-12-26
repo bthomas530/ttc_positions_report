@@ -41,7 +41,7 @@ except ImportError:
 # Configuration
 # ============================================
 APP_NAME = "TTC Positions Report"
-APP_VERSION = "2.0.2"
+APP_VERSION = "2.0.3"
 DEFAULT_PORT = 8082
 MAX_PORT_TRIES = 10
 
@@ -466,10 +466,33 @@ async def get_ibkr_data():
         market_data = {}
         tickers = []
         
+        # Create and qualify contracts before requesting market data
+        contracts = []
         for symbol in symbols:
             contract = Stock(symbol, 'SMART', 'USD')
-            ticker = ib.reqMktData(contract)
-            tickers.append((symbol, ticker))
+            contracts.append((symbol, contract))
+        
+        # Qualify all contracts in batch (this populates conId)
+        logger.info(f'Qualifying {len(contracts)} contracts...')
+        qualified_contracts = []
+        for symbol, contract in contracts:
+            try:
+                qualified = await ib.qualifyContractsAsync(contract)
+                if qualified:
+                    qualified_contracts.append((symbol, qualified[0]))
+                else:
+                    logger.warning(f'Could not qualify contract for {symbol}')
+            except Exception as e:
+                logger.warning(f'Error qualifying {symbol}: {e}')
+        
+        # Request market data for qualified contracts
+        logger.info(f'Requesting market data for {len(qualified_contracts)} contracts...')
+        for symbol, contract in qualified_contracts:
+            try:
+                ticker = ib.reqMktData(contract)
+                tickers.append((symbol, ticker))
+            except Exception as e:
+                logger.warning(f'Error requesting market data for {symbol}: {e}')
         
         await asyncio.sleep(1)
         
@@ -482,7 +505,10 @@ async def get_ibkr_data():
                 'low': ticker.low if hasattr(ticker, 'low') and ticker.low else 0,
                 'change': ticker.change if hasattr(ticker, 'change') and ticker.change else 0,
             }
-            ib.cancelMktData(ticker.contract)
+            try:
+                ib.cancelMktData(ticker.contract)
+            except:
+                pass
         
         stock_positions = {}
         option_positions = {}
@@ -933,7 +959,7 @@ def create_html_template(path):
             <div class="header-top">
                 <div class="brand">
                     <h1>TTC Positions</h1>
-                    <span class="version-badge">v2.0.2</span>
+                    <span class="version-badge">v2.0.3</span>
                 </div>
                 <div class="header-actions">
                     <div class="market-status" id="marketStatus">
@@ -1000,7 +1026,7 @@ def create_html_template(path):
             </section>
         </div>
         <footer class="footer">
-            <span>TTC Positions Report v2.0.2</span>
+            <span>TTC Positions Report v2.0.3</span>
             <span class="footer-sep">|</span>
             <span id="connectionStatus"><i class="fas fa-plug"></i> IBKR</span>
         </footer>
