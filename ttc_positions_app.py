@@ -1,5 +1,5 @@
 # TTC Positions Report - Desktop Application
-# v2.0.0 - User-friendly desktop app with auto-updates
+# v2.0.4 - User-friendly desktop app with auto-updates
 # Communicates with IBKR TWS and provides a native UI
 
 import asyncio
@@ -41,7 +41,7 @@ except ImportError:
 # Configuration
 # ============================================
 APP_NAME = "TTC Positions Report"
-APP_VERSION = "2.0.3"
+APP_VERSION = "2.0.4"
 DEFAULT_PORT = 8082
 MAX_PORT_TRIES = 10
 
@@ -444,10 +444,167 @@ def calculate_shares_available(shares, np, cc, uc):
     return shares - cc_shares - uc_shares
 
 # ============================================
+# Price Cache (Memory)
+# ============================================
+PRICE_CACHE_FILE = os.path.join(APP_DIR, 'price_cache.json')
+CACHE_MAX_AGE_DAYS = 7
+
+def load_price_cache():
+    """Load cached price data from disk"""
+    if os.path.exists(PRICE_CACHE_FILE):
+        try:
+            with open(PRICE_CACHE_FILE, 'r') as f:
+                cache = json.load(f)
+            logger.info(f'Loaded price cache with {len(cache.get("prices", {}))} symbols')
+            return cache
+        except Exception as e:
+            logger.warning(f'Could not load price cache: {e}')
+    return {'last_updated': None, 'prices': {}}
+
+def save_price_cache(market_data):
+    """Save current price data to disk cache, merging with existing data"""
+    try:
+        # Load existing cache and merge
+        existing = load_price_cache()
+        now_str = datetime.now().isoformat()
+        
+        for symbol, data in market_data.items():
+            # Only cache if we have a real price
+            if data.get('last', 0) > 0:
+                existing['prices'][symbol] = {
+                    **data,
+                    'timestamp': now_str
+                }
+        
+        # Prune entries older than CACHE_MAX_AGE_DAYS
+        cutoff = (datetime.now() - timedelta(days=CACHE_MAX_AGE_DAYS)).isoformat()
+        pruned = {}
+        for sym, entry in existing['prices'].items():
+            if entry.get('timestamp', '') >= cutoff:
+                pruned[sym] = entry
+        
+        cache = {
+            'last_updated': now_str,
+            'prices': pruned
+        }
+        
+        with open(PRICE_CACHE_FILE, 'w') as f:
+            json.dump(cache, f, indent=2)
+        
+        logger.info(f'Saved price cache: {len(pruned)} symbols (pruned {len(existing["prices"]) - len(pruned)} stale entries)')
+    except Exception as e:
+        logger.warning(f'Could not save price cache: {e}')
+
+def get_cached_price(symbol, cache=None):
+    """Get a single symbol's cached price data, or None if not available"""
+    if cache is None:
+        cache = load_price_cache()
+    return cache.get('prices', {}).get(symbol, None)
+
+def format_data_age(timestamp_str):
+    """Convert an ISO timestamp string into a human-readable age like '2h ago'"""
+    if not timestamp_str:
+        return 'Unknown'
+    try:
+        ts = datetime.fromisoformat(timestamp_str)
+        delta = datetime.now() - ts
+        total_seconds = int(delta.total_seconds())
+        if total_seconds < 60:
+            return 'Just now'
+        elif total_seconds < 3600:
+            mins = total_seconds // 60
+            return f'{mins}m ago'
+        elif total_seconds < 86400:
+            hours = total_seconds // 3600
+            return f'{hours}h ago'
+        else:
+            days = total_seconds // 86400
+            return f'{days}d ago'
+    except Exception:
+        return 'Unknown'
+
+# ============================================
+# Yahoo Finance Fallback
+# ============================================
+def is_cusip(symbol):
+    """Check if a symbol looks like a CUSIP identifier (bonds).
+    CUSIPs are 9-character alphanumeric with digits mixed in."""
+    if len(symbol) < 8:
+        return False
+    digit_count = sum(1 for c in symbol if c.isdigit())
+    return digit_count >= 3  # Real stock tickers rarely have 3+ digits
+
+def fetch_yahoo_prices(symbols):
+    """Fetch price data from Yahoo Finance for multiple symbols.
+    Returns dict of {symbol: {last, open, close, high, low, change, source}}"""
+    if not symbols:
+        return {}
+    
+    results = {}
+    # Filter out non-stock symbols (CUSIPs, bonds)
+    valid_symbols = [s for s in symbols if not is_cusip(s)]
+    if not valid_symbols:
+        return {}
+    
+    # Use the v8 chart endpoint for each symbol (more reliable than v7 quote)
+    # Process in batches to avoid overwhelming Yahoo
+    for symbol in valid_symbols:
+        try:
+            url = f'https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?range=1d&interval=1d'
+            req = urllib.request.Request(url, headers={
+                'User-Agent': f'{APP_NAME}/{APP_VERSION}',
+                'Accept': 'application/json'
+            })
+            with urllib.request.urlopen(req, timeout=5) as response:
+                data = json.loads(response.read().decode('utf-8'))
+            
+            chart = data.get('chart', {}).get('result', [])
+            if chart:
+                meta = chart[0].get('meta', {})
+                current_price = meta.get('regularMarketPrice', 0)
+                prev_close = meta.get('chartPreviousClose', 0) or meta.get('previousClose', 0)
+                
+                # Try to get OHLC from indicators
+                indicators = chart[0].get('indicators', {}).get('quote', [{}])
+                quote = indicators[0] if indicators else {}
+                opens = quote.get('open', [])
+                highs = quote.get('high', [])
+                lows = quote.get('low', [])
+                closes = quote.get('close', [])
+                
+                open_price = opens[-1] if opens and opens[-1] is not None else current_price
+                high_price = highs[-1] if highs and highs[-1] is not None else current_price
+                low_price = lows[-1] if lows and lows[-1] is not None else current_price
+                close_price = prev_close if prev_close else current_price
+                
+                change = current_price - close_price if close_price else 0
+                
+                if current_price and current_price > 0:
+                    results[symbol] = {
+                        'last': current_price,
+                        'open': open_price,
+                        'close': close_price,
+                        'high': high_price,
+                        'low': low_price,
+                        'change': change,
+                        'source': 'yahoo'
+                    }
+                    logger.debug(f'Yahoo Finance price for {symbol}: ${current_price:.2f}')
+        except urllib.error.HTTPError as e:
+            logger.debug(f'Yahoo Finance HTTP error for {symbol}: {e.code}')
+        except Exception as e:
+            logger.debug(f'Yahoo Finance error for {symbol}: {e}')
+    
+    if results:
+        logger.info(f'Yahoo Finance fallback: got prices for {len(results)}/{len(valid_symbols)} symbols')
+    
+    return results
+
+# ============================================
 # Data Functions
 # ============================================
 async def get_ibkr_data():
-    """Get position data from IBKR"""
+    """Get position data from IBKR with Yahoo Finance fallback and price caching"""
     global WATCHLIST
     
     try:
@@ -458,32 +615,53 @@ async def get_ibkr_data():
         positions = await ib.reqPositionsAsync()
         await asyncio.sleep(0.5)
         
-        symbols = set()
+        # Only collect symbols from STK and OPT positions (skip bonds, etc.)
+        stock_symbols = set()
+        skipped_types = {}
         for position in positions:
-            symbols.add(position.contract.symbol)
-        symbols.update(WATCHLIST)
+            contract = position.contract
+            if contract.secType in ('STK', 'OPT'):
+                stock_symbols.add(contract.symbol)
+            else:
+                skipped_types.setdefault(contract.secType, []).append(contract.symbol)
+        
+        # Log skipped non-stock position types once (not per-refresh spam)
+        for sec_type, syms in skipped_types.items():
+            logger.debug(f'Skipping {len(syms)} {sec_type} positions: {", ".join(syms[:5])}{"..." if len(syms) > 5 else ""}')
+        
+        # Add watchlist symbols, filtering out CUSIPs
+        watchlist_stock_symbols = [s for s in WATCHLIST if not is_cusip(s)]
+        stock_symbols.update(watchlist_stock_symbols)
         
         market_data = {}
+        data_sources = {}  # Track source per symbol
         tickers = []
         
-        # Create and qualify contracts before requesting market data
+        # Create and qualify contracts only for stock-like symbols
         contracts = []
-        for symbol in symbols:
-            contract = Stock(symbol, 'SMART', 'USD')
-            contracts.append((symbol, contract))
+        for symbol in stock_symbols:
+            if not is_cusip(symbol):
+                contract = Stock(symbol, 'SMART', 'USD')
+                contracts.append((symbol, contract))
         
         # Qualify all contracts in batch (this populates conId)
         logger.info(f'Qualifying {len(contracts)} contracts...')
         qualified_contracts = []
+        failed_symbols = []
         for symbol, contract in contracts:
             try:
                 qualified = await ib.qualifyContractsAsync(contract)
-                if qualified:
+                if qualified and qualified[0].conId:
                     qualified_contracts.append((symbol, qualified[0]))
                 else:
-                    logger.warning(f'Could not qualify contract for {symbol}')
+                    logger.debug(f'Could not qualify contract for {symbol}')
+                    failed_symbols.append(symbol)
             except Exception as e:
-                logger.warning(f'Error qualifying {symbol}: {e}')
+                logger.debug(f'Error qualifying {symbol}: {e}')
+                failed_symbols.append(symbol)
+        
+        if failed_symbols:
+            logger.info(f'Contract qualification failed for {len(failed_symbols)} symbols, will try Yahoo Finance fallback')
         
         # Request market data for qualified contracts
         logger.info(f'Requesting market data for {len(qualified_contracts)} contracts...')
@@ -493,22 +671,65 @@ async def get_ibkr_data():
                 tickers.append((symbol, ticker))
             except Exception as e:
                 logger.warning(f'Error requesting market data for {symbol}: {e}')
+                failed_symbols.append(symbol)
         
         await asyncio.sleep(1)
         
+        # Collect IBKR data and track which symbols got valid prices
+        symbols_needing_fallback = list(failed_symbols)
+        now_str = datetime.now().isoformat()
+        
         for symbol, ticker in tickers:
+            last_price = ticker.last if hasattr(ticker, 'last') and ticker.last else 0
             market_data[symbol] = {
-                'last': ticker.last if hasattr(ticker, 'last') and ticker.last else 0,
+                'last': last_price,
                 'open': ticker.open if hasattr(ticker, 'open') and ticker.open else 0,
                 'close': ticker.close if hasattr(ticker, 'close') and ticker.close else 0,
                 'high': ticker.high if hasattr(ticker, 'high') and ticker.high else 0,
                 'low': ticker.low if hasattr(ticker, 'low') and ticker.low else 0,
                 'change': ticker.change if hasattr(ticker, 'change') and ticker.change else 0,
+                'source': 'ibkr',
+                'timestamp': now_str
             }
+            # If IBKR returned 0 price, we need fallback
+            if last_price == 0 or last_price is None:
+                symbols_needing_fallback.append(symbol)
+            else:
+                data_sources[symbol] = 'ibkr'
+            
             try:
                 ib.cancelMktData(ticker.contract)
             except:
                 pass
+        
+        # Yahoo Finance fallback for symbols with missing prices
+        if symbols_needing_fallback:
+            unique_fallback = list(set(symbols_needing_fallback))
+            logger.info(f'Attempting Yahoo Finance fallback for {len(unique_fallback)} symbols: {", ".join(unique_fallback[:10])}{"..." if len(unique_fallback) > 10 else ""}')
+            yahoo_data = fetch_yahoo_prices(unique_fallback)
+            for symbol, ydata in yahoo_data.items():
+                market_data[symbol] = ydata
+                data_sources[symbol] = 'yahoo'
+        
+        # Cache fallback for any remaining symbols with no price
+        cache = load_price_cache()
+        for symbol in stock_symbols:
+            if symbol not in market_data or market_data[symbol].get('last', 0) == 0:
+                cached = get_cached_price(symbol, cache)
+                if cached and cached.get('last', 0) > 0:
+                    market_data[symbol] = {**cached, 'source': 'cached'}
+                    data_sources[symbol] = 'cached'
+                    logger.debug(f'Using cached price for {symbol}: ${cached["last"]:.2f} ({format_data_age(cached.get("timestamp"))})')
+        
+        # Save fresh data to cache
+        save_price_cache(market_data)
+        
+        # Add source tracking to market_data
+        for symbol in market_data:
+            if 'source' not in market_data[symbol]:
+                market_data[symbol]['source'] = data_sources.get(symbol, 'ibkr')
+            if 'timestamp' not in market_data[symbol]:
+                market_data[symbol]['timestamp'] = now_str
         
         stock_positions = {}
         option_positions = {}
@@ -518,9 +739,11 @@ async def get_ibkr_data():
             contract = position.contract
             symbol = contract.symbol
             
-            if symbol not in WATCHLIST:
-                WATCHLIST.append(symbol)
-                watchlist_updated = True
+            # Only add stock/option symbols to watchlist, not bonds
+            if contract.secType in ('STK', 'OPT') and not is_cusip(symbol):
+                if symbol not in WATCHLIST:
+                    WATCHLIST.append(symbol)
+                    watchlist_updated = True
             
             if contract.secType == 'STK':
                 stock_positions[symbol] = {
@@ -542,8 +765,10 @@ async def get_ibkr_data():
         basic_data = {
             'positions': [],
             'incomplete_lots': [],
-            'watchlist': [s for s in WATCHLIST if s not in stock_positions],
-            'market_data': market_data
+            'watchlist': [s for s in WATCHLIST if s not in stock_positions and not is_cusip(s)],
+            'market_data': market_data,
+            'data_sources': data_sources,
+            'connection_source': 'ibkr'
         }
         
         for symbol, stock_data in stock_positions.items():
@@ -594,9 +819,11 @@ async def get_ibkr_data():
         raise
 
 async def enhance_with_market_data(basic_data):
-    """Process market data into final format"""
+    """Process market data into final format with source metadata"""
     try:
         market_data = basic_data['market_data']
+        data_sources = basic_data.get('data_sources', {})
+        connection_source = basic_data.get('connection_source', 'ibkr')
         
         def safe_divide(a, b):
             try:
@@ -628,13 +855,20 @@ async def enhance_with_market_data(basic_data):
             daily_change_pct = safe_divide(daily_change, base_price)
             opening_gap = safe_number(open_price - close_price if close_price else 0)
             
+            # Source metadata
+            source = mkt_data.get('source', data_sources.get(symbol, 'ibkr'))
+            timestamp = mkt_data.get('timestamp', '')
+            data_age = format_data_age(timestamp) if source == 'cached' else ''
+            
             return {
                 'current_price': current_price,
                 'daily_change': daily_change,
                 'daily_change_pct': daily_change_pct,
                 'close_price': close_price,
                 'open_price': open_price,
-                'opening_gap': opening_gap
+                'opening_gap': opening_gap,
+                'source': source,
+                'data_age': data_age
             }
         
         enhanced_positions = []
@@ -644,24 +878,26 @@ async def enhance_with_market_data(basic_data):
             data = process_market_data(symbol, mkt_data)
             
             enhanced_positions.append([
-                symbol,
-                safe_number(pos['shares']),
-                data['current_price'],
-                safe_number(pos['avgCost']),
-                data['daily_change'],
-                data['daily_change_pct'],
-                data['close_price'],
-                data['open_price'],
-                data['opening_gap'],
-                safe_number(pos['naked_puts']),
-                safe_number(pos['covered_calls']),
-                safe_number(pos['uncovered_calls']),
-                safe_number(calculate_shares_available(
+                symbol,                                        # 0
+                safe_number(pos['shares']),                    # 1
+                data['current_price'],                         # 2
+                safe_number(pos['avgCost']),                   # 3
+                data['daily_change'],                          # 4
+                data['daily_change_pct'],                      # 5
+                data['close_price'],                           # 6
+                data['open_price'],                            # 7
+                data['opening_gap'],                           # 8
+                safe_number(pos['naked_puts']),                # 9
+                safe_number(pos['covered_calls']),             # 10
+                safe_number(pos['uncovered_calls']),           # 11
+                safe_number(calculate_shares_available(        # 12
                     pos['shares'], 
                     pos['naked_puts'], 
                     pos['covered_calls'], 
                     pos['uncovered_calls']
-                ))
+                )),
+                data['source'],                                # 13
+                data['data_age']                               # 14
             ])
         
         enhanced_incomplete = []
@@ -671,15 +907,17 @@ async def enhance_with_market_data(basic_data):
             data = process_market_data(symbol, mkt_data)
             
             enhanced_incomplete.append([
-                symbol,
-                safe_number(lot['shares']),
-                data['current_price'],
-                safe_number(lot['avgCost']),
-                data['daily_change'],
-                data['daily_change_pct'],
-                data['close_price'],
-                data['open_price'],
-                data['opening_gap']
+                symbol,                                        # 0
+                safe_number(lot['shares']),                    # 1
+                data['current_price'],                         # 2
+                safe_number(lot['avgCost']),                   # 3
+                data['daily_change'],                          # 4
+                data['daily_change_pct'],                      # 5
+                data['close_price'],                           # 6
+                data['open_price'],                            # 7
+                data['opening_gap'],                           # 8
+                data['source'],                                # 9
+                data['data_age']                               # 10
             ])
         
         enhanced_watchlist = []
@@ -688,19 +926,22 @@ async def enhance_with_market_data(basic_data):
             data = process_market_data(symbol, mkt_data)
             
             enhanced_watchlist.append([
-                symbol,
-                data['current_price'],
-                data['daily_change'],
-                data['daily_change_pct'],
-                data['close_price'],
-                data['open_price'],
-                data['opening_gap']
+                symbol,                                        # 0
+                data['current_price'],                         # 1
+                data['daily_change'],                          # 2
+                data['daily_change_pct'],                      # 3
+                data['close_price'],                           # 4
+                data['open_price'],                            # 5
+                data['opening_gap'],                           # 6
+                data['source'],                                # 7
+                data['data_age']                               # 8
             ])
         
         return {
             'positions': enhanced_positions,
             'incomplete_lots': enhanced_incomplete,
-            'watchlist': enhanced_watchlist
+            'watchlist': enhanced_watchlist,
+            'connection_source': connection_source
         }
         
     except Exception as e:
@@ -727,14 +968,63 @@ async def get_data():
         return jsonify(enhanced_data)
     except Exception as e:
         logger.error(f'Error in get_data: {str(e)}', exc_info=True)
-        # Return user-friendly error message
+        
+        # Try to serve cached data with Yahoo Finance updates when IBKR is down
+        try:
+            logger.info('IBKR unavailable, attempting fallback with Yahoo Finance + cache...')
+            cache = load_price_cache()
+            cached_prices = cache.get('prices', {})
+            
+            if cached_prices:
+                # We have cached data - try to refresh via Yahoo, then serve
+                all_symbols = list(cached_prices.keys())
+                yahoo_data = fetch_yahoo_prices(all_symbols)
+                
+                # Merge: prefer Yahoo fresh data, fall back to cache
+                market_data = {}
+                data_sources = {}
+                for symbol in all_symbols:
+                    if symbol in yahoo_data:
+                        market_data[symbol] = yahoo_data[symbol]
+                        data_sources[symbol] = 'yahoo'
+                    elif symbol in cached_prices and cached_prices[symbol].get('last', 0) > 0:
+                        market_data[symbol] = {**cached_prices[symbol], 'source': 'cached'}
+                        data_sources[symbol] = 'cached'
+                
+                # Save any fresh Yahoo data to cache
+                if yahoo_data:
+                    save_price_cache(yahoo_data)
+                
+                # Reconstruct basic_data from cache (we don't have positions from IBKR)
+                # We can only serve watchlist-style data for all cached symbols
+                fallback_data = {
+                    'positions': [],
+                    'incomplete_lots': [],
+                    'watchlist': all_symbols,
+                    'market_data': market_data,
+                    'data_sources': data_sources,
+                    'connection_source': 'yahoo' if yahoo_data else 'cached'
+                }
+                
+                enhanced_data = await enhance_with_market_data(fallback_data)
+                cache_age = format_data_age(cache.get('last_updated', ''))
+                logger.info(f'Serving fallback data: {len(enhanced_data.get("watchlist", []))} symbols (cache age: {cache_age})')
+                
+                enhanced_data['fallback'] = True
+                enhanced_data['fallback_message'] = f'IBKR disconnected. Showing {"Yahoo Finance" if yahoo_data else "cached"} data ({cache_age}).'
+                return jsonify(enhanced_data)
+        except Exception as fallback_error:
+            logger.error(f'Fallback also failed: {fallback_error}')
+        
+        # If everything fails, return error
         friendly_error = get_friendly_error(str(e))
         return jsonify({
             'error': friendly_error,
-            'technical_error': str(e),  # Keep for debugging
+            'technical_error': str(e),
             'positions': [],
             'incomplete_lots': [],
-            'watchlist': []
+            'watchlist': [],
+            'connection_source': 'unavailable'
         }), 500
 
 @app.route('/api/test')
@@ -905,19 +1195,39 @@ def ensure_resources():
     app.template_folder = template_dir
     app.static_folder = static_dir
     
-    # Check if resources need to be created
+    # Check if resources need to be created or updated
     index_path = os.path.join(template_dir, 'index.html')
     css_path = os.path.join(static_dir, 'css', 'styles.css')
     js_path = os.path.join(static_dir, 'js', 'script.js')
     
-    if not os.path.exists(index_path):
+    # Check version marker to detect when resources need regeneration
+    version_marker = os.path.join(RESOURCES_DIR, '.version')
+    needs_update = True
+    if os.path.exists(version_marker):
+        try:
+            with open(version_marker, 'r') as f:
+                if f.read().strip() == APP_VERSION:
+                    needs_update = False
+        except:
+            pass
+    
+    if needs_update or not os.path.exists(index_path):
         create_html_template(index_path)
     
-    if not os.path.exists(css_path):
+    if needs_update or not os.path.exists(css_path):
         create_css_file(css_path)
     
-    if not os.path.exists(js_path):
+    if needs_update or not os.path.exists(js_path):
         create_js_file(js_path)
+    
+    # Write version marker
+    if needs_update:
+        try:
+            with open(version_marker, 'w') as f:
+                f.write(APP_VERSION)
+            logger.info(f'Resources updated to v{APP_VERSION}')
+        except:
+            pass
     
     logger.info(f'Resources directory: {RESOURCES_DIR}')
 
@@ -959,7 +1269,7 @@ def create_html_template(path):
             <div class="header-top">
                 <div class="brand">
                     <h1>TTC Positions</h1>
-                    <span class="version-badge">v2.0.3</span>
+                    <span class="version-badge">v2.0.4</span>
                 </div>
                 <div class="header-actions">
                     <div class="market-status" id="marketStatus">
@@ -1026,7 +1336,7 @@ def create_html_template(path):
             </section>
         </div>
         <footer class="footer">
-            <span>TTC Positions Report v2.0.3</span>
+            <span>TTC Positions Report v2.0.4</span>
             <span class="footer-sep">|</span>
             <span id="connectionStatus"><i class="fas fa-plug"></i> IBKR</span>
         </footer>
@@ -1040,7 +1350,7 @@ def create_html_template(path):
 
 def create_css_file(path):
     """Create CSS file - can be edited without rebuilding!"""
-    css = ''':root{--bg-primary:#f8fafc;--bg-secondary:#fff;--bg-tertiary:#f1f5f9;--text-primary:#1e293b;--text-secondary:#64748b;--text-muted:#94a3b8;--border-color:#e2e8f0;--border-light:#f1f5f9;--accent-primary:#3b82f6;--accent-secondary:#8b5cf6;--positive:#10b981;--positive-bg:#d1fae5;--negative:#ef4444;--negative-bg:#fee2e2;--warning:#f59e0b;--warning-bg:#fef3c7;--shadow-sm:0 1px 2px rgba(0,0,0,.05);--shadow-md:0 4px 6px -1px rgba(0,0,0,.1);--shadow-lg:0 10px 15px -3px rgba(0,0,0,.1);--radius-sm:6px;--radius-md:10px;--radius-lg:16px;--font-sans:'Plus Jakarta Sans',-apple-system,BlinkMacSystemFont,sans-serif;--font-mono:'JetBrains Mono','SF Mono',monospace}[data-theme=dark]{--bg-primary:#0f172a;--bg-secondary:#1e293b;--bg-tertiary:#334155;--text-primary:#f1f5f9;--text-secondary:#94a3b8;--text-muted:#64748b;--border-color:#334155;--border-light:#1e293b;--positive:#34d399;--positive-bg:rgba(16,185,129,.15);--negative:#f87171;--negative-bg:rgba(239,68,68,.15);--warning-bg:rgba(245,158,11,.15)}*{margin:0;padding:0;box-sizing:border-box}body{font-family:var(--font-sans);background:var(--bg-primary);color:var(--text-primary);min-height:100vh;transition:background-color .3s,color .3s}body.compact table td,body.compact table th{padding:6px 8px;font-size:13px}.container{max-width:1800px;margin:0 auto;padding:16px 20px}.header{background:var(--bg-secondary);border-radius:var(--radius-lg);padding:20px 24px;margin-bottom:20px;box-shadow:var(--shadow-md);border:1px solid var(--border-color)}.header-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}.brand{display:flex;align-items:center;gap:12px}.brand h1{font-size:1.75rem;font-weight:700;background:linear-gradient(135deg,var(--accent-primary),var(--accent-secondary));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}.version-badge{background:var(--bg-tertiary);color:var(--text-secondary);padding:4px 10px;border-radius:20px;font-size:12px;font-weight:500;font-family:var(--font-mono)}.header-actions{display:flex;align-items:center;gap:12px}.market-status{display:flex;align-items:center;gap:8px;padding:8px 14px;background:var(--bg-tertiary);border-radius:var(--radius-md);font-size:13px;font-weight:500}.market-status.open .status-dot{background:var(--positive);box-shadow:0 0 8px var(--positive)}.market-status.closed .status-dot{background:var(--negative)}.status-dot{width:8px;height:8px;border-radius:50%;background:var(--text-muted);animation:pulse 2s infinite}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}.status-countdown{font-family:var(--font-mono);color:var(--text-muted);font-size:12px}.icon-btn{width:40px;height:40px;display:flex;align-items:center;justify-content:center;background:var(--bg-tertiary);border:1px solid var(--border-color);border-radius:var(--radius-md);color:var(--text-secondary);cursor:pointer;transition:all .2s}.icon-btn:hover{background:var(--accent-primary);color:#fff;border-color:var(--accent-primary);transform:translateY(-1px)}.summary-bar{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:16px}.stat-card{background:var(--bg-tertiary);border-radius:var(--radius-md);padding:12px 16px;text-align:center;border:1px solid var(--border-color)}.stat-label{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-muted);margin-bottom:4px}.stat-value{font-size:1.25rem;font-weight:700;font-family:var(--font-mono);color:var(--text-primary)}.stat-value.positive{color:var(--positive)}.stat-value.negative{color:var(--negative)}.controls-row{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:12px}.search-container{position:relative;flex:1;max-width:400px}.search-container .search-icon{position:absolute;left:14px;top:50%;transform:translateY(-50%);color:var(--text-muted);font-size:14px}#searchInput{width:100%;padding:10px 40px;background:var(--bg-tertiary);border:1px solid var(--border-color);border-radius:var(--radius-md);font-size:14px;color:var(--text-primary);transition:all .2s}#searchInput:focus{outline:0;border-color:var(--accent-primary);box-shadow:0 0 0 3px rgba(59,130,246,.15)}#searchInput::placeholder{color:var(--text-muted)}.clear-search{position:absolute;right:10px;top:50%;transform:translateY(-50%);background:0 0;border:none;color:var(--text-muted);cursor:pointer;padding:4px;display:none}#searchInput:not(:placeholder-shown)+.clear-search{display:block}.control-group{display:flex;align-items:center;gap:10px}.refresh-rate{padding:10px 14px;background:var(--bg-tertiary);border:1px solid var(--border-color);border-radius:var(--radius-md);font-size:13px;color:var(--text-primary);cursor:pointer}.refresh-btn{display:flex;align-items:center;gap:8px;padding:10px 18px;background:linear-gradient(135deg,var(--accent-primary),var(--accent-secondary));border:none;border-radius:var(--radius-md);color:#fff;font-weight:600;font-size:14px;cursor:pointer;transition:all .2s}.refresh-btn:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(59,130,246,.4)}.refresh-icon.refreshing{animation:spin 1s linear infinite}@keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}.last-update{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-muted)}.section{background:var(--bg-secondary);border-radius:var(--radius-lg);margin-bottom:16px;box-shadow:var(--shadow-md);border:1px solid var(--border-color);overflow:hidden}.section-header{display:flex;justify-content:space-between;align-items:center;padding:16px 20px;background:var(--bg-tertiary);cursor:pointer;user-select:none;transition:background .2s}.section-header:hover{background:var(--border-color)}.section-header h2{display:flex;align-items:center;gap:10px;font-size:1rem;font-weight:600;color:var(--text-primary)}.section-header h2 i{color:var(--accent-primary)}.section-controls{display:flex;align-items:center;gap:10px}.section-count{background:var(--accent-primary);color:#fff;padding:2px 10px;border-radius:20px;font-size:12px;font-weight:600;font-family:var(--font-mono)}.section-toggle{color:var(--text-muted);transition:transform .3s}.section.collapsed .section-toggle{transform:rotate(-90deg)}.section.collapsed .section-content{display:none}.section-content{padding:0}.table-container{overflow-x:auto}table{width:100%;border-collapse:collapse}thead{position:sticky;top:0;z-index:10}th{padding:12px 14px;background:var(--bg-tertiary);color:var(--text-secondary);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px;text-align:right;border-bottom:2px solid var(--border-color);white-space:nowrap;position:relative}th:first-child{text-align:left;padding-left:20px}th.sortable{cursor:pointer;padding-right:28px}th.sortable:hover{color:var(--accent-primary)}th.sortable::after{content:'↕';position:absolute;right:10px;top:50%;transform:translateY(-50%);font-size:10px;color:var(--text-muted)}th.sortable.asc::after{content:'↑';color:var(--accent-primary)}th.sortable.desc::after{content:'↓';color:var(--accent-primary)}td{padding:14px;text-align:right;border-bottom:1px solid var(--border-light);font-size:14px;font-family:var(--font-mono)}td:first-child{text-align:left;padding-left:20px;font-weight:600;font-family:var(--font-sans)}tr{transition:background .15s}tr:hover{background:var(--bg-tertiary)}.symbol-link{color:var(--text-primary);text-decoration:none;display:inline-flex;align-items:center;gap:6px;transition:color .2s}.symbol-link:hover{color:var(--accent-primary)}.symbol-link .external-icon{opacity:0;font-size:10px;transition:opacity .2s}.symbol-link:hover .external-icon{opacity:1}.positive{color:var(--positive)!important}.negative{color:var(--negative)!important}.zero-shares{color:var(--negative);font-weight:700}.naked-puts{background:var(--warning-bg);color:var(--warning);font-weight:600;border-radius:4px;padding:4px 8px}.covered-calls{background:var(--positive-bg);color:var(--positive);font-weight:600;border-radius:4px;padding:4px 8px}.uncovered-calls{background:var(--negative-bg);color:var(--negative);font-weight:600;border-radius:4px;padding:4px 8px}.shares-available{background:var(--warning-bg);border-radius:4px;padding:4px 8px}.shares-negative{background:var(--negative-bg);color:var(--negative);font-weight:600;border-radius:4px;padding:4px 8px}tr.hidden{display:none}.no-results{padding:40px;text-align:center;color:var(--text-muted)}.skeleton-loader{padding:20px}.skeleton-row{height:48px;background:linear-gradient(90deg,var(--bg-tertiary) 25%,var(--border-color) 50%,var(--bg-tertiary) 75%);background-size:200% 100%;animation:shimmer 1.5s infinite;border-radius:var(--radius-sm);margin-bottom:8px}@keyframes shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}#toast-container{position:fixed;top:20px;right:20px;z-index:9999;display:flex;flex-direction:column;gap:10px}.toast{display:flex;align-items:center;gap:12px;padding:14px 20px;background:var(--bg-secondary);border:1px solid var(--border-color);border-radius:var(--radius-md);box-shadow:var(--shadow-lg);animation:slideIn .3s ease;min-width:280px}.toast.success{border-left:4px solid var(--positive)}.toast.error{border-left:4px solid var(--negative)}.toast.info{border-left:4px solid var(--accent-primary)}.toast-icon{font-size:18px}.toast.success .toast-icon{color:var(--positive)}.toast.error .toast-icon{color:var(--negative)}.toast.info .toast-icon{color:var(--accent-primary)}.toast-message{flex:1;font-size:14px;color:var(--text-primary)}.toast-close{background:0 0;border:none;color:var(--text-muted);cursor:pointer;padding:4px}@keyframes slideIn{from{transform:translateX(100%);opacity:0}to{transform:translateX(0);opacity:1}}@keyframes slideOut{from{transform:translateX(0);opacity:1}to{transform:translateX(100%);opacity:0}}.modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.5);backdrop-filter:blur(4px);z-index:10000;align-items:center;justify-content:center}.modal.active{display:flex}.modal-content{background:var(--bg-secondary);border-radius:var(--radius-lg);padding:24px;min-width:360px;box-shadow:var(--shadow-lg);border:1px solid var(--border-color)}.modal-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px}.modal-header h3{font-size:1.25rem;font-weight:600}.modal-close{background:0 0;border:none;font-size:24px;color:var(--text-muted);cursor:pointer}.shortcuts-list{display:flex;flex-direction:column;gap:12px}.shortcut{display:flex;align-items:center;gap:16px}kbd{display:inline-flex;align-items:center;justify-content:center;min-width:32px;padding:4px 10px;background:var(--bg-tertiary);border:1px solid var(--border-color);border-radius:6px;font-family:var(--font-mono);font-size:13px;font-weight:600;color:var(--text-primary)}.footer{display:flex;align-items:center;justify-content:center;gap:12px;padding:16px;color:var(--text-muted);font-size:12px}.footer-sep{color:var(--border-color)}#connectionStatus{display:flex;align-items:center;gap:6px}#connectionStatus.connected{color:var(--positive)}#connectionStatus.disconnected{color:var(--negative)}@media (max-width:1024px){.summary-bar{grid-template-columns:repeat(3,1fr)}}@media (max-width:768px){.header-top{flex-direction:column;gap:16px}.summary-bar{grid-template-columns:repeat(2,1fr)}.controls-row{flex-direction:column}.search-container{max-width:100%}}'''
+    css = ''':root{--bg-primary:#f8fafc;--bg-secondary:#fff;--bg-tertiary:#f1f5f9;--text-primary:#1e293b;--text-secondary:#64748b;--text-muted:#94a3b8;--border-color:#e2e8f0;--border-light:#f1f5f9;--accent-primary:#3b82f6;--accent-secondary:#8b5cf6;--positive:#10b981;--positive-bg:#d1fae5;--negative:#ef4444;--negative-bg:#fee2e2;--warning:#f59e0b;--warning-bg:#fef3c7;--shadow-sm:0 1px 2px rgba(0,0,0,.05);--shadow-md:0 4px 6px -1px rgba(0,0,0,.1);--shadow-lg:0 10px 15px -3px rgba(0,0,0,.1);--radius-sm:6px;--radius-md:10px;--radius-lg:16px;--font-sans:'Plus Jakarta Sans',-apple-system,BlinkMacSystemFont,sans-serif;--font-mono:'JetBrains Mono','SF Mono',monospace}[data-theme=dark]{--bg-primary:#0f172a;--bg-secondary:#1e293b;--bg-tertiary:#334155;--text-primary:#f1f5f9;--text-secondary:#94a3b8;--text-muted:#64748b;--border-color:#334155;--border-light:#1e293b;--positive:#34d399;--positive-bg:rgba(16,185,129,.15);--negative:#f87171;--negative-bg:rgba(239,68,68,.15);--warning-bg:rgba(245,158,11,.15)}*{margin:0;padding:0;box-sizing:border-box}body{font-family:var(--font-sans);background:var(--bg-primary);color:var(--text-primary);min-height:100vh;transition:background-color .3s,color .3s}body.compact table td,body.compact table th{padding:6px 8px;font-size:13px}.container{max-width:1800px;margin:0 auto;padding:16px 20px}.header{background:var(--bg-secondary);border-radius:var(--radius-lg);padding:20px 24px;margin-bottom:20px;box-shadow:var(--shadow-md);border:1px solid var(--border-color)}.header-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}.brand{display:flex;align-items:center;gap:12px}.brand h1{font-size:1.75rem;font-weight:700;background:linear-gradient(135deg,var(--accent-primary),var(--accent-secondary));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}.version-badge{background:var(--bg-tertiary);color:var(--text-secondary);padding:4px 10px;border-radius:20px;font-size:12px;font-weight:500;font-family:var(--font-mono)}.header-actions{display:flex;align-items:center;gap:12px}.market-status{display:flex;align-items:center;gap:8px;padding:8px 14px;background:var(--bg-tertiary);border-radius:var(--radius-md);font-size:13px;font-weight:500}.market-status.open .status-dot{background:var(--positive);box-shadow:0 0 8px var(--positive)}.market-status.closed .status-dot{background:var(--negative)}.status-dot{width:8px;height:8px;border-radius:50%;background:var(--text-muted);animation:pulse 2s infinite}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}.status-countdown{font-family:var(--font-mono);color:var(--text-muted);font-size:12px}.icon-btn{width:40px;height:40px;display:flex;align-items:center;justify-content:center;background:var(--bg-tertiary);border:1px solid var(--border-color);border-radius:var(--radius-md);color:var(--text-secondary);cursor:pointer;transition:all .2s}.icon-btn:hover{background:var(--accent-primary);color:#fff;border-color:var(--accent-primary);transform:translateY(-1px)}.summary-bar{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:16px}.stat-card{background:var(--bg-tertiary);border-radius:var(--radius-md);padding:12px 16px;text-align:center;border:1px solid var(--border-color)}.stat-label{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-muted);margin-bottom:4px}.stat-value{font-size:1.25rem;font-weight:700;font-family:var(--font-mono);color:var(--text-primary)}.stat-value.positive{color:var(--positive)}.stat-value.negative{color:var(--negative)}.controls-row{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:12px}.search-container{position:relative;flex:1;max-width:400px}.search-container .search-icon{position:absolute;left:14px;top:50%;transform:translateY(-50%);color:var(--text-muted);font-size:14px}#searchInput{width:100%;padding:10px 40px;background:var(--bg-tertiary);border:1px solid var(--border-color);border-radius:var(--radius-md);font-size:14px;color:var(--text-primary);transition:all .2s}#searchInput:focus{outline:0;border-color:var(--accent-primary);box-shadow:0 0 0 3px rgba(59,130,246,.15)}#searchInput::placeholder{color:var(--text-muted)}.clear-search{position:absolute;right:10px;top:50%;transform:translateY(-50%);background:0 0;border:none;color:var(--text-muted);cursor:pointer;padding:4px;display:none}#searchInput:not(:placeholder-shown)+.clear-search{display:block}.control-group{display:flex;align-items:center;gap:10px}.refresh-rate{padding:10px 14px;background:var(--bg-tertiary);border:1px solid var(--border-color);border-radius:var(--radius-md);font-size:13px;color:var(--text-primary);cursor:pointer}.refresh-btn{display:flex;align-items:center;gap:8px;padding:10px 18px;background:linear-gradient(135deg,var(--accent-primary),var(--accent-secondary));border:none;border-radius:var(--radius-md);color:#fff;font-weight:600;font-size:14px;cursor:pointer;transition:all .2s}.refresh-btn:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(59,130,246,.4)}.refresh-icon.refreshing{animation:spin 1s linear infinite}@keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}.last-update{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-muted)}.section{background:var(--bg-secondary);border-radius:var(--radius-lg);margin-bottom:16px;box-shadow:var(--shadow-md);border:1px solid var(--border-color);overflow:hidden}.section-header{display:flex;justify-content:space-between;align-items:center;padding:16px 20px;background:var(--bg-tertiary);cursor:pointer;user-select:none;transition:background .2s}.section-header:hover{background:var(--border-color)}.section-header h2{display:flex;align-items:center;gap:10px;font-size:1rem;font-weight:600;color:var(--text-primary)}.section-header h2 i{color:var(--accent-primary)}.section-controls{display:flex;align-items:center;gap:10px}.section-count{background:var(--accent-primary);color:#fff;padding:2px 10px;border-radius:20px;font-size:12px;font-weight:600;font-family:var(--font-mono)}.section-toggle{color:var(--text-muted);transition:transform .3s}.section.collapsed .section-toggle{transform:rotate(-90deg)}.section.collapsed .section-content{display:none}.section-content{padding:0}.table-container{overflow-x:auto}table{width:100%;border-collapse:collapse}thead{position:sticky;top:0;z-index:10}th{padding:12px 14px;background:var(--bg-tertiary);color:var(--text-secondary);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px;text-align:right;border-bottom:2px solid var(--border-color);white-space:nowrap;position:relative}th:first-child{text-align:left;padding-left:20px}th.sortable{cursor:pointer;padding-right:28px}th.sortable:hover{color:var(--accent-primary)}th.sortable::after{content:'↕';position:absolute;right:10px;top:50%;transform:translateY(-50%);font-size:10px;color:var(--text-muted)}th.sortable.asc::after{content:'↑';color:var(--accent-primary)}th.sortable.desc::after{content:'↓';color:var(--accent-primary)}td{padding:14px;text-align:right;border-bottom:1px solid var(--border-light);font-size:14px;font-family:var(--font-mono)}td:first-child{text-align:left;padding-left:20px;font-weight:600;font-family:var(--font-sans)}tr{transition:background .15s}tr:hover{background:var(--bg-tertiary)}.symbol-link{color:var(--text-primary);text-decoration:none;display:inline-flex;align-items:center;gap:6px;transition:color .2s}.symbol-link:hover{color:var(--accent-primary)}.symbol-link .external-icon{opacity:0;font-size:10px;transition:opacity .2s}.symbol-link:hover .external-icon{opacity:1}.positive{color:var(--positive)!important}.negative{color:var(--negative)!important}.zero-shares{color:var(--negative);font-weight:700}.naked-puts{background:var(--warning-bg);color:var(--warning);font-weight:600;border-radius:4px;padding:4px 8px}.covered-calls{background:var(--positive-bg);color:var(--positive);font-weight:600;border-radius:4px;padding:4px 8px}.uncovered-calls{background:var(--negative-bg);color:var(--negative);font-weight:600;border-radius:4px;padding:4px 8px}.shares-available{background:var(--warning-bg);border-radius:4px;padding:4px 8px}.shares-negative{background:var(--negative-bg);color:var(--negative);font-weight:600;border-radius:4px;padding:4px 8px}tr.hidden{display:none}.no-results{padding:40px;text-align:center;color:var(--text-muted)}.skeleton-loader{padding:20px}.skeleton-row{height:48px;background:linear-gradient(90deg,var(--bg-tertiary) 25%,var(--border-color) 50%,var(--bg-tertiary) 75%);background-size:200% 100%;animation:shimmer 1.5s infinite;border-radius:var(--radius-sm);margin-bottom:8px}@keyframes shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}#toast-container{position:fixed;top:20px;right:20px;z-index:9999;display:flex;flex-direction:column;gap:10px}.toast{display:flex;align-items:center;gap:12px;padding:14px 20px;background:var(--bg-secondary);border:1px solid var(--border-color);border-radius:var(--radius-md);box-shadow:var(--shadow-lg);animation:slideIn .3s ease;min-width:280px}.toast.success{border-left:4px solid var(--positive)}.toast.error{border-left:4px solid var(--negative)}.toast.info{border-left:4px solid var(--accent-primary)}.toast-icon{font-size:18px}.toast.success .toast-icon{color:var(--positive)}.toast.error .toast-icon{color:var(--negative)}.toast.info .toast-icon{color:var(--accent-primary)}.toast-message{flex:1;font-size:14px;color:var(--text-primary)}.toast-close{background:0 0;border:none;color:var(--text-muted);cursor:pointer;padding:4px}@keyframes slideIn{from{transform:translateX(100%);opacity:0}to{transform:translateX(0);opacity:1}}@keyframes slideOut{from{transform:translateX(0);opacity:1}to{transform:translateX(100%);opacity:0}}.modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.5);backdrop-filter:blur(4px);z-index:10000;align-items:center;justify-content:center}.modal.active{display:flex}.modal-content{background:var(--bg-secondary);border-radius:var(--radius-lg);padding:24px;min-width:360px;box-shadow:var(--shadow-lg);border:1px solid var(--border-color)}.modal-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px}.modal-header h3{font-size:1.25rem;font-weight:600}.modal-close{background:0 0;border:none;font-size:24px;color:var(--text-muted);cursor:pointer}.shortcuts-list{display:flex;flex-direction:column;gap:12px}.shortcut{display:flex;align-items:center;gap:16px}kbd{display:inline-flex;align-items:center;justify-content:center;min-width:32px;padding:4px 10px;background:var(--bg-tertiary);border:1px solid var(--border-color);border-radius:6px;font-family:var(--font-mono);font-size:13px;font-weight:600;color:var(--text-primary)}.footer{display:flex;align-items:center;justify-content:center;gap:12px;padding:16px;color:var(--text-muted);font-size:12px}.footer-sep{color:var(--border-color)}#connectionStatus{display:flex;align-items:center;gap:6px}#connectionStatus.connected{color:var(--positive)}#connectionStatus.disconnected{color:var(--negative)}#connectionStatus.fallback{color:var(--warning)}.price-cell{display:inline-flex;align-items:center;gap:6px}.source-dot{display:inline-block;width:7px;height:7px;border-radius:50%;flex-shrink:0;position:relative;cursor:help}.source-dot.ibkr{background:var(--positive);box-shadow:0 0 4px var(--positive)}.source-dot.yahoo{background:var(--warning);box-shadow:0 0 4px var(--warning)}.source-dot.cached{background:var(--text-muted);box-shadow:0 0 4px var(--text-muted)}.source-dot.unavailable{background:var(--negative);box-shadow:0 0 4px var(--negative)}.price-stale{opacity:.7;font-style:italic}.price-tooltip{position:absolute;bottom:calc(100% + 8px);left:50%;transform:translateX(-50%);background:var(--bg-secondary);border:1px solid var(--border-color);border-radius:var(--radius-sm);padding:8px 12px;font-size:11px;font-family:var(--font-sans);font-style:normal;white-space:nowrap;box-shadow:var(--shadow-lg);z-index:100;pointer-events:none;opacity:0;transition:opacity .15s}.source-dot:hover .price-tooltip{opacity:1}.tooltip-source{font-weight:600;margin-bottom:2px}.tooltip-age{color:var(--text-muted)}.fallback-banner{background:linear-gradient(135deg,var(--warning),#d97706);color:#fff;padding:10px 20px;text-align:center;font-size:13px;font-weight:500;border-radius:var(--radius-md);margin-bottom:12px;display:flex;align-items:center;justify-content:center;gap:8px}@media (max-width:1024px){.summary-bar{grid-template-columns:repeat(3,1fr)}}@media (max-width:768px){.header-top{flex-direction:column;gap:16px}.summary-bar{grid-template-columns:repeat(2,1fr)}.controls-row{flex-direction:column}.search-container{max-width:100%}}'''
     with open(path, 'w', encoding='utf-8') as f:
         f.write(css)
     logger.info(f'Created: {path}')
@@ -1050,7 +1360,7 @@ def create_js_file(path):
     # Using readable JS for debugging - will help identify issues
     js = '''
 // TTC Positions Report - Frontend JavaScript
-// Version 2.0.2
+// Version 2.0.4
 
 let isRefreshing = false;
 let currentSort = { column: null, direction: "asc" };
@@ -1196,9 +1506,9 @@ function exportToCSV() {
         showToast("No data to export", "error");
         return;
     }
-    let csv = ["Symbol","Shares","Current Price","Avg Price","Daily Change $","Daily Change %","Last Price","Open","OGap","NP","CC","UC","Shares Available"].join(",") + "\\n";
+    let csv = ["Symbol","Shares","Current Price","Avg Price","Daily Change $","Daily Change %","Last Price","Open","OGap","NP","CC","UC","Shares Available","Data Source"].join(",") + "\\n";
     cachedData.positions.forEach(row => {
-        csv += row.map((val, i) => i === 5 ? (val * 100).toFixed(2) + "%" : (typeof val === "number" ? val.toFixed(2) : val)).join(",") + "\\n";
+        csv += row.slice(0, 14).map((val, i) => i === 5 ? (val * 100).toFixed(2) + "%" : (typeof val === "number" ? val.toFixed(2) : val)).join(",") + "\\n";
     });
     const blob = new Blob([csv], { type: "text/csv" });
     const a = document.createElement("a");
@@ -1237,11 +1547,54 @@ function createSymbolLink(symbol) {
     return a;
 }
 
+function getSourceInfo(row, section) {
+    // Extract source and data_age from the row based on section type
+    // positions: source at [13], data_age at [14]
+    // incomplete: source at [9], data_age at [10]
+    // watchlist: source at [7], data_age at [8]
+    let source = "ibkr", dataAge = "";
+    if (section === "positions") {
+        source = row[13] || "ibkr";
+        dataAge = row[14] || "";
+    } else if (section === "incomplete") {
+        source = row[9] || "ibkr";
+        dataAge = row[10] || "";
+    } else if (section === "watchlist") {
+        source = row[7] || "ibkr";
+        dataAge = row[8] || "";
+    }
+    return { source, dataAge };
+}
+
+function createSourceDot(source, dataAge) {
+    const dot = document.createElement("span");
+    dot.className = "source-dot " + source;
+    
+    const sourceLabels = {
+        ibkr: "IBKR Live",
+        yahoo: "Yahoo Finance",
+        cached: "Cached Data",
+        unavailable: "Unavailable"
+    };
+    
+    const tooltip = document.createElement("span");
+    tooltip.className = "price-tooltip";
+    let tooltipHtml = '<div class="tooltip-source">' + (sourceLabels[source] || source) + '</div>';
+    if (dataAge) {
+        tooltipHtml += '<div class="tooltip-age">' + dataAge + '</div>';
+    }
+    tooltip.innerHTML = tooltipHtml;
+    dot.appendChild(tooltip);
+    
+    return dot;
+}
+
 function createTable(data, headers, section) {
     const table = document.createElement("table");
     const thead = document.createElement("thead");
     const headerRow = document.createElement("tr");
     
+    // Display headers exclude source metadata columns
     let sectionHeaders = headers;
     if (section === "incomplete") {
         sectionHeaders = headers.filter(h => !["NP", "CC", "UC", "Shares Available"].includes(h));
@@ -1264,6 +1617,8 @@ function createTable(data, headers, section) {
     
     data.forEach(row => {
         const tr = document.createElement("tr");
+        const { source, dataAge } = getSourceInfo(row, section);
+        
         let rowData = [...row];
         if (section === "incomplete") {
             rowData = rowData.filter((_, i) => !["NP", "CC", "UC", "Shares Available"].includes(headers[i]));
@@ -1278,25 +1633,43 @@ function createTable(data, headers, section) {
             if (header === "Underlying") {
                 td.appendChild(createSymbolLink(cell));
             } else if (typeof cell === "number") {
-                td.textContent = formatNumber(cell, header);
-                if (["Daily Change $", "Daily Change %", "OGap"].includes(header)) {
-                    if (cell > 0) td.classList.add("positive");
-                    if (cell < 0) td.classList.add("negative");
-                } else if (header === "Current Price") {
+                if (header === "Current Price") {
+                    // Add source indicator dot for Current Price column
+                    const wrapper = document.createElement("span");
+                    wrapper.className = "price-cell";
+                    if (source === "cached") wrapper.classList.add("price-stale");
+                    
+                    const priceText = document.createElement("span");
+                    priceText.textContent = formatNumber(cell, header);
+                    wrapper.appendChild(priceText);
+                    
+                    // Only show dot when source is not IBKR (non-live data)
+                    if (source !== "ibkr") {
+                        wrapper.appendChild(createSourceDot(source, dataAge));
+                    }
+                    
+                    td.appendChild(wrapper);
+                    
                     const changeIdx = headers.indexOf("Daily Change $");
                     if (row[changeIdx] > 0) td.classList.add("positive");
                     if (row[changeIdx] < 0) td.classList.add("negative");
-                } else if (header === "Shares" && cell === 0) {
-                    td.classList.add("zero-shares");
-                } else if (header === "NP" && cell > 0) {
-                    td.classList.add("naked-puts");
-                } else if (header === "CC" && cell > 0) {
-                    td.classList.add("covered-calls");
-                } else if (header === "UC" && cell > 0) {
-                    td.classList.add("uncovered-calls");
-                } else if (header === "Shares Available") {
-                    if (cell > 0) td.classList.add("shares-available");
-                    if (cell < 0) td.classList.add("shares-negative");
+                } else {
+                    td.textContent = formatNumber(cell, header);
+                    if (["Daily Change $", "Daily Change %", "OGap"].includes(header)) {
+                        if (cell > 0) td.classList.add("positive");
+                        if (cell < 0) td.classList.add("negative");
+                    } else if (header === "Shares" && cell === 0) {
+                        td.classList.add("zero-shares");
+                    } else if (header === "NP" && cell > 0) {
+                        td.classList.add("naked-puts");
+                    } else if (header === "CC" && cell > 0) {
+                        td.classList.add("covered-calls");
+                    } else if (header === "UC" && cell > 0) {
+                        td.classList.add("uncovered-calls");
+                    } else if (header === "Shares Available") {
+                        if (cell > 0) td.classList.add("shares-available");
+                        if (cell < 0) td.classList.add("shares-negative");
+                    }
                 }
             } else {
                 td.textContent = cell;
@@ -1416,6 +1789,36 @@ function setLoadingState(loading) {
     }
 }
 
+function updateConnectionStatus(data) {
+    const statusEl = document.getElementById("connectionStatus");
+    const source = data.connection_source || "ibkr";
+    
+    // Remove any existing fallback banner
+    const existingBanner = document.querySelector(".fallback-banner");
+    if (existingBanner) existingBanner.remove();
+    
+    if (data.fallback) {
+        // Show fallback banner
+        const banner = document.createElement("div");
+        banner.className = "fallback-banner";
+        banner.innerHTML = '<i class="fas fa-exclamation-triangle"></i> ' + (data.fallback_message || "Using fallback data");
+        const header = document.querySelector(".header");
+        header.parentElement.insertBefore(banner, header.nextSibling);
+        
+        statusEl.className = "fallback";
+        statusEl.innerHTML = '<i class="fas fa-plug"></i> ' + (source === "yahoo" ? "Yahoo Finance" : "Cached Data");
+    } else if (source === "ibkr") {
+        statusEl.className = "connected";
+        statusEl.innerHTML = '<i class="fas fa-plug"></i> IBKR Connected';
+    } else if (source === "yahoo") {
+        statusEl.className = "fallback";
+        statusEl.innerHTML = '<i class="fas fa-plug"></i> Yahoo Finance';
+    } else if (source === "cached") {
+        statusEl.className = "fallback";
+        statusEl.innerHTML = '<i class="fas fa-plug"></i> Cached Data';
+    }
+}
+
 async function updateTables() {
     log("updateTables called");
     if (isRefreshing) {
@@ -1432,13 +1835,14 @@ async function updateTables() {
         const response = await fetch("/api/data");
         log("Response status: " + response.status);
         
-        if (!response.ok) {
-            const errData = await response.json();
-            throw new Error(errData.error || "Server error");
+        const data = await response.json();
+        
+        // Handle error responses that may still contain fallback data
+        if (!response.ok && !data.fallback) {
+            throw new Error(data.error || "Server error");
         }
         
-        const data = await response.json();
-        log("Data received: " + data.positions.length + " positions");
+        log("Data received: " + data.positions.length + " positions, " + data.watchlist.length + " watchlist");
         cachedData = data;
         
         const headers = ["Underlying", "Shares", "Current Price", "Avg Price", "Daily Change $", "Daily Change %", "Last Price", "Open", "OGap", "NP", "CC", "UC", "Shares Available"];
@@ -1458,13 +1862,16 @@ async function updateTables() {
         updateLastUpdateTime();
         updateSummaryStats(data);
         updateSectionCounts(data);
+        updateConnectionStatus(data);
         
         const searchVal = document.getElementById("searchInput").value;
         if (searchVal) filterTables(searchVal);
         
-        document.getElementById("connectionStatus").className = "connected";
-        document.getElementById("connectionStatus").innerHTML = '<i class="fas fa-plug"></i> IBKR Connected';
-        showToast("Data refreshed", "success", 1500);
+        if (data.fallback) {
+            showToast(data.fallback_message || "Using fallback data", "info", 3000);
+        } else {
+            showToast("Data refreshed", "success", 1500);
+        }
         
     } catch (error) {
         log("Error: " + error.message);

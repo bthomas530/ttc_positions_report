@@ -2,7 +2,7 @@
 
 A desktop application for monitoring your Interactive Brokers positions with real-time market data, beautiful dark/light themes, and automatic updates.
 
-![Version](https://img.shields.io/badge/version-2.0.0-blue)
+![Version](https://img.shields.io/badge/version-2.0.4-blue)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Mac-lightgrey)
 
 ## Features

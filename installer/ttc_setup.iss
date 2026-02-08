@@ -13,7 +13,7 @@
 ;   4. Find the installer in Output/ folder
 
 #define MyAppName "TTC Positions Report"
-#define MyAppVersion "2.0.0"
+#define MyAppVersion "2.0.4"
 #define MyAppPublisher "TTC"
 #define MyAppURL "https://github.com/your-username/ttc-positions"
 #define MyAppExeName "TTC Positions Report.exe"
