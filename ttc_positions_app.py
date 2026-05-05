@@ -1,5 +1,5 @@
 # TTC Positions Report - Desktop Application
-# v2.0.4 - User-friendly desktop app with auto-updates
+# v2.1.0 - Robust IBKR connection: fast probe, circuit breaker, diagnostics modal
 # Communicates with IBKR TWS and provides a native UI
 
 import asyncio
@@ -41,9 +41,28 @@ except ImportError:
 # Configuration
 # ============================================
 APP_NAME = "TTC Positions Report"
-APP_VERSION = "2.0.4"
+APP_VERSION = "2.1.0"
 DEFAULT_PORT = 8082
 MAX_PORT_TRIES = 10
+
+# IBKR connection endpoints (host, port, label) tried in priority order.
+# 7496 = TWS Live, 7497 = TWS Paper, 4001 = IB Gateway Live, 4002 = IB Gateway Paper.
+IBKR_ENDPOINTS = [
+    ("127.0.0.1", 7496, "TWS Live"),
+    ("127.0.0.1", 7497, "TWS Paper"),
+    ("127.0.0.1", 4001, "Gateway Live"),
+    ("127.0.0.1", 4002, "Gateway Paper"),
+]
+IBKR_CLIENT_ID = 1
+IBKR_CONNECT_TIMEOUT = 4     # seconds for ib_async handshake
+IBKR_PROBE_TIMEOUT = 0.25    # seconds for socket pre-check
+
+# Circuit breaker thresholds: (consecutive_failures, cooldown_seconds)
+IBKR_BREAKER_LEVELS = [
+    (3, 30),
+    (6, 120),
+    (10, 300),
+]
 
 # GitHub configuration for auto-updates
 # Set these to your repository details
@@ -403,29 +422,207 @@ def async_route(f):
 # ============================================
 # IBKR Connection
 # ============================================
-async def connect_to_ib():
-    """Connect to IBKR TWS or Gateway"""
-    ib = IB()
-    connected = False
-    
-    try:
-        await ib.connectAsync('127.0.0.1', 7496, clientId=1)
-        connected = True
-        logger.info('Connected to IBKR on port 7496 (TWS)')
-    except Exception as e:
-        logger.warning(f'Connection to TWS port 7496 failed: {e}')
-    
-    if not connected:
+class IBKRUnavailableError(Exception):
+    """Base class for IBKR connection failures classified by root cause."""
+    verdict = 'unknown'
+
+    def __init__(self, message, probes=None, attempts=None):
+        super().__init__(message)
+        # Per-endpoint probe results (list of dicts), used by /api/diagnostics
+        self.probes = probes or []
+        # Per-endpoint handshake attempts (list of dicts) when probe succeeded but handshake didn't
+        self.attempts = attempts or []
+
+class NoListenerError(IBKRUnavailableError):
+    """No IBKR client (TWS or Gateway) is listening on any known port."""
+    verdict = 'no_listener'
+
+class HandshakeTimeoutError(IBKRUnavailableError):
+    """A port was open but the API handshake timed out (API likely disabled)."""
+    verdict = 'handshake_timeout'
+
+class ClientIdInUseError(IBKRUnavailableError):
+    """Another client is already connected with this clientId."""
+    verdict = 'client_id_in_use'
+
+# Module-level circuit breaker state. Reset on every successful connect.
+_ibkr_breaker = {
+    'consecutive_failures': 0,
+    'open_until': None,        # datetime; if set and now < it, skip IBKR
+    'last_error': None,        # short string ('no_listener', 'handshake_timeout', etc.)
+    'last_error_message': None,
+    'last_probes': [],         # last per-endpoint probe results
+    'last_attempts': [],       # last per-endpoint handshake attempts
+    'last_success': None,      # datetime of last successful connect
+    'last_endpoint': None,     # (host, port, label) of last successful connect
+}
+
+def _breaker_cooldown_seconds(consecutive_failures):
+    """Pick a cooldown duration based on how many failures we've seen in a row."""
+    cooldown = 0
+    for threshold, seconds in IBKR_BREAKER_LEVELS:
+        if consecutive_failures >= threshold:
+            cooldown = seconds
+    return cooldown
+
+def is_breaker_open():
+    """True if the IBKR circuit breaker is currently open (skip connection attempts)."""
+    open_until = _ibkr_breaker.get('open_until')
+    if not open_until:
+        return False
+    if datetime.now() >= open_until:
+        # Cooldown elapsed; allow a probe attempt but keep failure counter
+        _ibkr_breaker['open_until'] = None
+        return False
+    return True
+
+def breaker_retry_seconds():
+    """Seconds remaining until breaker auto-closes, or 0 if not open."""
+    open_until = _ibkr_breaker.get('open_until')
+    if not open_until:
+        return 0
+    remaining = (open_until - datetime.now()).total_seconds()
+    return max(0, int(remaining))
+
+def _record_breaker_success(host, port, label):
+    """Reset breaker state after a successful connect."""
+    _ibkr_breaker['consecutive_failures'] = 0
+    _ibkr_breaker['open_until'] = None
+    _ibkr_breaker['last_error'] = None
+    _ibkr_breaker['last_error_message'] = None
+    _ibkr_breaker['last_success'] = datetime.now()
+    _ibkr_breaker['last_endpoint'] = (host, port, label)
+
+def _record_breaker_failure(error):
+    """Increment failure counter and possibly open the breaker."""
+    _ibkr_breaker['consecutive_failures'] += 1
+    _ibkr_breaker['last_error'] = getattr(error, 'verdict', 'unknown')
+    _ibkr_breaker['last_error_message'] = str(error)
+    _ibkr_breaker['last_probes'] = list(getattr(error, 'probes', []) or [])
+    _ibkr_breaker['last_attempts'] = list(getattr(error, 'attempts', []) or [])
+    cooldown = _breaker_cooldown_seconds(_ibkr_breaker['consecutive_failures'])
+    if cooldown > 0:
+        _ibkr_breaker['open_until'] = datetime.now() + timedelta(seconds=cooldown)
+        logger.info(
+            f'IBKR breaker OPEN for {cooldown}s after '
+            f'{_ibkr_breaker["consecutive_failures"]} consecutive failures '
+            f'(last error: {_ibkr_breaker["last_error"]})'
+        )
+
+def probe_ib_ports(endpoints=None, timeout=None):
+    """Fast TCP pre-check for each IBKR endpoint.
+
+    Returns a list of dicts: [{host, port, label, reachable, latency_ms, error}].
+    Uses socket.connect_ex which returns in ~5 ms when a port is closed on loopback.
+    """
+    if endpoints is None:
+        endpoints = IBKR_ENDPOINTS
+    if timeout is None:
+        timeout = IBKR_PROBE_TIMEOUT
+
+    results = []
+    for host, port, label in endpoints:
+        start = time.time()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        err_code = None
+        err_msg = None
         try:
-            await ib.connectAsync('127.0.0.1', 7497, clientId=1)
-            connected = True
-            logger.info('Connected to IBKR on port 7497 (Gateway)')
+            err_code = sock.connect_ex((host, port))
+        except socket.timeout:
+            err_code = -1
+            err_msg = 'timeout'
         except Exception as e:
-            logger.error(f'Connection to Gateway port 7497 failed: {e}')
-            # User-friendly error message
-            raise ConnectionError("Please make sure Trader Workstation is running, then click Refresh.")
-    
-    return ib
+            err_code = -1
+            err_msg = str(e)
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+        latency_ms = int((time.time() - start) * 1000)
+
+        if err_code == 0:
+            results.append({
+                'host': host, 'port': port, 'label': label,
+                'reachable': True, 'latency_ms': latency_ms, 'error': None,
+            })
+        else:
+            if err_msg is None:
+                # WSAECONNREFUSED (Windows), ECONNREFUSED (Linux=111, macOS=61)
+                if err_code in (10061, 111, 61):
+                    err_msg = 'connection refused'
+                elif err_code == -1:
+                    err_msg = 'timeout'
+                else:
+                    err_msg = f'errno {err_code}'
+            results.append({
+                'host': host, 'port': port, 'label': label,
+                'reachable': False, 'latency_ms': latency_ms, 'error': err_msg,
+            })
+    return results
+
+def _classify_handshake_error(exc):
+    """Map an ib_async exception to one of our typed errors."""
+    msg = str(exc).lower()
+    if 'clientid' in msg or 'already in use' in msg or 'peer closed' in msg:
+        return 'client_id_in_use'
+    if isinstance(exc, asyncio.TimeoutError) or 'timeout' in msg or 'timed out' in msg:
+        return 'handshake_timeout'
+    return 'unknown'
+
+async def connect_to_ib():
+    """Connect to IBKR TWS or Gateway with fast probe + classified errors.
+
+    Probes all IBKR_ENDPOINTS first (~5 ms each on loopback). For every reachable
+    endpoint, attempts an ib_async handshake with IBKR_CONNECT_TIMEOUT. Cleans up
+    half-open IB() instances on failure. Raises a typed IBKRUnavailableError so
+    callers can record breaker state and serve user-friendly diagnostics.
+    """
+    probes = probe_ib_ports()
+    open_endpoints = [p for p in probes if p['reachable']]
+
+    if not open_endpoints:
+        raise NoListenerError(
+            'No IBKR client (TWS or Gateway) is listening on any standard port.',
+            probes=probes,
+        )
+
+    attempts = []
+    for probe in open_endpoints:
+        host, port, label = probe['host'], probe['port'], probe['label']
+        ib = IB()
+        try:
+            await ib.connectAsync(host, port, clientId=IBKR_CLIENT_ID, timeout=IBKR_CONNECT_TIMEOUT)
+            logger.info(f'Connected to IBKR on {host}:{port} ({label})')
+            attempts.append({'host': host, 'port': port, 'label': label, 'connected': True, 'error': None})
+            _record_breaker_success(host, port, label)
+            return ib
+        except Exception as e:
+            verdict = _classify_handshake_error(e)
+            logger.warning(f'Handshake failed on {host}:{port} ({label}) [{verdict}]: {e}')
+            attempts.append({'host': host, 'port': port, 'label': label, 'connected': False, 'error': str(e), 'verdict': verdict})
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+
+    # All open endpoints failed handshake; pick the strongest verdict for the caller
+    verdicts = [a.get('verdict') for a in attempts]
+    if 'client_id_in_use' in verdicts:
+        raise ClientIdInUseError(
+            f'IBKR is reachable but clientId={IBKR_CLIENT_ID} is already in use by another client.',
+            probes=probes, attempts=attempts,
+        )
+    if 'handshake_timeout' in verdicts:
+        raise HandshakeTimeoutError(
+            'IBKR port is open but the API handshake timed out. Is the API enabled in TWS?',
+            probes=probes, attempts=attempts,
+        )
+    raise IBKRUnavailableError(
+        'IBKR port is open but the API handshake failed for an unknown reason.',
+        probes=probes, attempts=attempts,
+    )
 
 def is_market_open():
     """Check if US stock market is open"""
@@ -813,7 +1010,10 @@ async def get_ibkr_data():
         logger.info('Disconnected from IBKR')
         
         return basic_data
-        
+
+    except IBKRUnavailableError:
+        # Already logged by /api/data with verdict; re-raise without traceback spam
+        raise
     except Exception as e:
         logger.error(f'Error getting IBKR data: {e}')
         raise
@@ -955,10 +1155,77 @@ async def enhance_with_market_data(basic_data):
 def index():
     return render_template('index.html')
 
+async def _serve_yahoo_fallback(reason):
+    """Build the Yahoo + cache fallback response. Returns (json_dict, status_code) or (None, None)."""
+    try:
+        logger.info(f'Serving fallback (reason: {reason})...')
+        cache = load_price_cache()
+        cached_prices = cache.get('prices', {})
+
+        if not cached_prices:
+            return None, None
+
+        all_symbols = list(cached_prices.keys())
+        yahoo_data = fetch_yahoo_prices(all_symbols)
+
+        market_data = {}
+        data_sources = {}
+        for symbol in all_symbols:
+            if symbol in yahoo_data:
+                market_data[symbol] = yahoo_data[symbol]
+                data_sources[symbol] = 'yahoo'
+            elif symbol in cached_prices and cached_prices[symbol].get('last', 0) > 0:
+                market_data[symbol] = {**cached_prices[symbol], 'source': 'cached'}
+                data_sources[symbol] = 'cached'
+
+        if yahoo_data:
+            save_price_cache(yahoo_data)
+
+        fallback_data = {
+            'positions': [],
+            'incomplete_lots': [],
+            'watchlist': all_symbols,
+            'market_data': market_data,
+            'data_sources': data_sources,
+            'connection_source': 'yahoo' if yahoo_data else 'cached',
+        }
+
+        enhanced_data = await enhance_with_market_data(fallback_data)
+        cache_age = format_data_age(cache.get('last_updated', ''))
+        logger.info(f'Serving fallback data: {len(enhanced_data.get("watchlist", []))} symbols (cache age: {cache_age})')
+
+        enhanced_data['fallback'] = True
+        enhanced_data['fallback_reason'] = reason
+        enhanced_data['fallback_message'] = (
+            f'IBKR disconnected. Showing {"Yahoo Finance" if yahoo_data else "cached"} data ({cache_age}).'
+        )
+        if reason == 'breaker_open':
+            enhanced_data['fallback_message'] += f' Auto-retry paused for {breaker_retry_seconds()}s.'
+        return enhanced_data, 200
+    except Exception as fallback_error:
+        logger.error(f'Fallback also failed: {fallback_error}')
+        return None, None
+
 @app.route('/api/data')
 @async_route
 async def get_data():
     logger.info('API /api/data called - starting data fetch')
+
+    # Circuit breaker: if open, skip IBKR entirely and serve fallback immediately
+    if is_breaker_open():
+        retry_in = breaker_retry_seconds()
+        last_err = _ibkr_breaker.get('last_error') or 'unknown'
+        logger.info(f'IBKR breaker open (retry in {retry_in}s, last error: {last_err}), skipping IBKR')
+        enhanced_data, _ = await _serve_yahoo_fallback('breaker_open')
+        if enhanced_data is not None:
+            return jsonify(enhanced_data)
+        return jsonify({
+            'error': 'IBKR unavailable and no cached data to serve.',
+            'positions': [], 'incomplete_lots': [], 'watchlist': [],
+            'connection_source': 'unavailable',
+            'fallback': False,
+        }), 503
+
     try:
         logger.info('Fetching IBKR data...')
         ibkr_data = await get_ibkr_data()
@@ -966,65 +1233,32 @@ async def get_data():
         enhanced_data = await enhance_with_market_data(ibkr_data)
         logger.info(f'Data fetch complete: {len(enhanced_data.get("positions", []))} positions')
         return jsonify(enhanced_data)
+    except IBKRUnavailableError as e:
+        # Typed connection failure: log a single line, no traceback spam
+        logger.warning(f'IBKR unavailable [{e.verdict}]: {e}')
+        _record_breaker_failure(e)
+        enhanced_data, _ = await _serve_yahoo_fallback(e.verdict)
+        if enhanced_data is not None:
+            return jsonify(enhanced_data)
+        return jsonify({
+            'error': get_friendly_error(str(e)),
+            'technical_error': str(e),
+            'verdict': e.verdict,
+            'positions': [], 'incomplete_lots': [], 'watchlist': [],
+            'connection_source': 'unavailable',
+        }), 503
     except Exception as e:
+        # Unknown error from inside get_ibkr_data after a successful connect
         logger.error(f'Error in get_data: {str(e)}', exc_info=True)
-        
-        # Try to serve cached data with Yahoo Finance updates when IBKR is down
-        try:
-            logger.info('IBKR unavailable, attempting fallback with Yahoo Finance + cache...')
-            cache = load_price_cache()
-            cached_prices = cache.get('prices', {})
-            
-            if cached_prices:
-                # We have cached data - try to refresh via Yahoo, then serve
-                all_symbols = list(cached_prices.keys())
-                yahoo_data = fetch_yahoo_prices(all_symbols)
-                
-                # Merge: prefer Yahoo fresh data, fall back to cache
-                market_data = {}
-                data_sources = {}
-                for symbol in all_symbols:
-                    if symbol in yahoo_data:
-                        market_data[symbol] = yahoo_data[symbol]
-                        data_sources[symbol] = 'yahoo'
-                    elif symbol in cached_prices and cached_prices[symbol].get('last', 0) > 0:
-                        market_data[symbol] = {**cached_prices[symbol], 'source': 'cached'}
-                        data_sources[symbol] = 'cached'
-                
-                # Save any fresh Yahoo data to cache
-                if yahoo_data:
-                    save_price_cache(yahoo_data)
-                
-                # Reconstruct basic_data from cache (we don't have positions from IBKR)
-                # We can only serve watchlist-style data for all cached symbols
-                fallback_data = {
-                    'positions': [],
-                    'incomplete_lots': [],
-                    'watchlist': all_symbols,
-                    'market_data': market_data,
-                    'data_sources': data_sources,
-                    'connection_source': 'yahoo' if yahoo_data else 'cached'
-                }
-                
-                enhanced_data = await enhance_with_market_data(fallback_data)
-                cache_age = format_data_age(cache.get('last_updated', ''))
-                logger.info(f'Serving fallback data: {len(enhanced_data.get("watchlist", []))} symbols (cache age: {cache_age})')
-                
-                enhanced_data['fallback'] = True
-                enhanced_data['fallback_message'] = f'IBKR disconnected. Showing {"Yahoo Finance" if yahoo_data else "cached"} data ({cache_age}).'
-                return jsonify(enhanced_data)
-        except Exception as fallback_error:
-            logger.error(f'Fallback also failed: {fallback_error}')
-        
-        # If everything fails, return error
+        enhanced_data, _ = await _serve_yahoo_fallback('unknown')
+        if enhanced_data is not None:
+            return jsonify(enhanced_data)
         friendly_error = get_friendly_error(str(e))
         return jsonify({
             'error': friendly_error,
             'technical_error': str(e),
-            'positions': [],
-            'incomplete_lots': [],
-            'watchlist': [],
-            'connection_source': 'unavailable'
+            'positions': [], 'incomplete_lots': [], 'watchlist': [],
+            'connection_source': 'unavailable',
         }), 500
 
 @app.route('/api/test')
@@ -1042,6 +1276,91 @@ def get_status():
         'resources_dir': RESOURCES_DIR,
         'using_external_resources': RESOURCES_DIR == EXTERNAL_RESOURCES
     })
+
+# User-facing remediation messages keyed by verdict
+DIAGNOSTIC_MESSAGES = {
+    'no_listener': (
+        'No IBKR client (TWS or Gateway) is listening on any standard port. '
+        'Start Trader Workstation, then in TWS go to: '
+        'File \u2192 Global Configuration \u2192 API \u2192 Settings, '
+        'and enable \u201cEnable ActiveX and Socket Clients\u201d. '
+        'Make sure 127.0.0.1 is in the Trusted IPs list, then click Refresh.'
+    ),
+    'handshake_timeout': (
+        'TWS/Gateway is running but the API handshake timed out. '
+        'Open File \u2192 Global Configuration \u2192 API \u2192 Settings and confirm: '
+        '\u201cEnable ActiveX and Socket Clients\u201d is checked, the Socket port matches, '
+        'and 127.0.0.1 is in the Trusted IPs list. Then click Refresh.'
+    ),
+    'client_id_in_use': (
+        'TWS/Gateway is running but another program is already connected with clientId='
+        + str(IBKR_CLIENT_ID) + '. Close any other API client (or another copy of this app), then click Refresh.'
+    ),
+    'unknown': (
+        'TWS/Gateway is running but the API connection failed for an unknown reason. '
+        'Try restarting TWS, then click Refresh.'
+    ),
+    'ok': 'IBKR is reachable.',
+}
+
+def build_diagnostics():
+    """Run a fresh probe and assemble the diagnostics payload."""
+    probes = probe_ib_ports()
+    open_endpoints = [p for p in probes if p['reachable']]
+
+    # Pick a verdict: prefer last_error if breaker has been tripped recently;
+    # otherwise infer from the live probe.
+    verdict = 'ok'
+    if not open_endpoints:
+        verdict = 'no_listener'
+    if _ibkr_breaker.get('last_error') and _ibkr_breaker.get('consecutive_failures', 0) > 0:
+        verdict = _ibkr_breaker['last_error']
+
+    cache = load_price_cache()
+    cached_prices = cache.get('prices', {})
+
+    last_endpoint = _ibkr_breaker.get('last_endpoint')
+    last_success = _ibkr_breaker.get('last_success')
+
+    return {
+        'platform': platform.platform(),
+        'app_version': APP_VERSION,
+        'client_id': IBKR_CLIENT_ID,
+        'endpoints': probes,
+        'breaker': {
+            'open': is_breaker_open(),
+            'consecutive_failures': _ibkr_breaker.get('consecutive_failures', 0),
+            'retry_in_seconds': breaker_retry_seconds(),
+            'last_error': _ibkr_breaker.get('last_error'),
+            'last_error_message': _ibkr_breaker.get('last_error_message'),
+        },
+        'last_success': {
+            'timestamp': last_success.isoformat() if last_success else None,
+            'age': format_data_age(last_success.isoformat()) if last_success else None,
+            'host': last_endpoint[0] if last_endpoint else None,
+            'port': last_endpoint[1] if last_endpoint else None,
+            'label': last_endpoint[2] if last_endpoint else None,
+        },
+        'cache': {
+            'symbols': len(cached_prices),
+            'last_updated': cache.get('last_updated'),
+            'age': format_data_age(cache.get('last_updated', '')),
+        },
+        'verdict': verdict,
+        'user_message': DIAGNOSTIC_MESSAGES.get(verdict, DIAGNOSTIC_MESSAGES['unknown']),
+    }
+
+@app.route('/api/diagnostics')
+def api_diagnostics():
+    """Return per-endpoint reachability, breaker state, cache, and a user-facing message."""
+    try:
+        return jsonify(build_diagnostics())
+    except Exception as e:
+        logger.error(f'Error building diagnostics: {e}', exc_info=True)
+        return jsonify({
+            'error': 'Could not build diagnostics',
+            'technical_error': str(e),
+        }), 500
 
 @app.route('/api/version')
 def get_version():
@@ -1264,12 +1583,26 @@ def create_html_template(path):
             </div>
         </div>
     </div>
+    <div id="diagnostics-modal" class="modal">
+        <div class="modal-content diagnostics-modal-content">
+            <div class="modal-header">
+                <h3><i class="fas fa-stethoscope"></i> Connection Diagnostics</h3>
+                <button class="modal-close" onclick="closeDiagnosticsModal()">&times;</button>
+            </div>
+            <div id="diagnostics-body" class="diagnostics-body">
+                <div class="diagnostics-loading">Running probe...</div>
+            </div>
+            <div class="diagnostics-footer">
+                <button id="diagnosticsRefreshBtn" class="refresh-btn"><i class="fa-solid fa-arrows-rotate"></i> <span>Re-run probe</span></button>
+            </div>
+        </div>
+    </div>
     <div class="container">
         <header class="header">
             <div class="header-top">
                 <div class="brand">
                     <h1>TTC Positions</h1>
-                    <span class="version-badge">v2.0.4</span>
+                    <span class="version-badge">v2.1.0</span>
                 </div>
                 <div class="header-actions">
                     <div class="market-status" id="marketStatus">
@@ -1336,9 +1669,9 @@ def create_html_template(path):
             </section>
         </div>
         <footer class="footer">
-            <span>TTC Positions Report v2.0.4</span>
+            <span>TTC Positions Report v2.1.0</span>
             <span class="footer-sep">|</span>
-            <span id="connectionStatus"><i class="fas fa-plug"></i> IBKR</span>
+            <span id="connectionStatus" class="clickable" title="Click for connection diagnostics"><i class="fas fa-plug"></i> IBKR</span>
         </footer>
     </div>
     <script src="{{ url_for('static', filename='js/script.js') }}"></script>
@@ -1350,7 +1683,7 @@ def create_html_template(path):
 
 def create_css_file(path):
     """Create CSS file - can be edited without rebuilding!"""
-    css = ''':root{--bg-primary:#f8fafc;--bg-secondary:#fff;--bg-tertiary:#f1f5f9;--text-primary:#1e293b;--text-secondary:#64748b;--text-muted:#94a3b8;--border-color:#e2e8f0;--border-light:#f1f5f9;--accent-primary:#3b82f6;--accent-secondary:#8b5cf6;--positive:#10b981;--positive-bg:#d1fae5;--negative:#ef4444;--negative-bg:#fee2e2;--warning:#f59e0b;--warning-bg:#fef3c7;--shadow-sm:0 1px 2px rgba(0,0,0,.05);--shadow-md:0 4px 6px -1px rgba(0,0,0,.1);--shadow-lg:0 10px 15px -3px rgba(0,0,0,.1);--radius-sm:6px;--radius-md:10px;--radius-lg:16px;--font-sans:'Plus Jakarta Sans',-apple-system,BlinkMacSystemFont,sans-serif;--font-mono:'JetBrains Mono','SF Mono',monospace}[data-theme=dark]{--bg-primary:#0f172a;--bg-secondary:#1e293b;--bg-tertiary:#334155;--text-primary:#f1f5f9;--text-secondary:#94a3b8;--text-muted:#64748b;--border-color:#334155;--border-light:#1e293b;--positive:#34d399;--positive-bg:rgba(16,185,129,.15);--negative:#f87171;--negative-bg:rgba(239,68,68,.15);--warning-bg:rgba(245,158,11,.15)}*{margin:0;padding:0;box-sizing:border-box}body{font-family:var(--font-sans);background:var(--bg-primary);color:var(--text-primary);min-height:100vh;transition:background-color .3s,color .3s}body.compact table td,body.compact table th{padding:6px 8px;font-size:13px}.container{max-width:1800px;margin:0 auto;padding:16px 20px}.header{background:var(--bg-secondary);border-radius:var(--radius-lg);padding:20px 24px;margin-bottom:20px;box-shadow:var(--shadow-md);border:1px solid var(--border-color)}.header-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}.brand{display:flex;align-items:center;gap:12px}.brand h1{font-size:1.75rem;font-weight:700;background:linear-gradient(135deg,var(--accent-primary),var(--accent-secondary));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}.version-badge{background:var(--bg-tertiary);color:var(--text-secondary);padding:4px 10px;border-radius:20px;font-size:12px;font-weight:500;font-family:var(--font-mono)}.header-actions{display:flex;align-items:center;gap:12px}.market-status{display:flex;align-items:center;gap:8px;padding:8px 14px;background:var(--bg-tertiary);border-radius:var(--radius-md);font-size:13px;font-weight:500}.market-status.open .status-dot{background:var(--positive);box-shadow:0 0 8px var(--positive)}.market-status.closed .status-dot{background:var(--negative)}.status-dot{width:8px;height:8px;border-radius:50%;background:var(--text-muted);animation:pulse 2s infinite}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}.status-countdown{font-family:var(--font-mono);color:var(--text-muted);font-size:12px}.icon-btn{width:40px;height:40px;display:flex;align-items:center;justify-content:center;background:var(--bg-tertiary);border:1px solid var(--border-color);border-radius:var(--radius-md);color:var(--text-secondary);cursor:pointer;transition:all .2s}.icon-btn:hover{background:var(--accent-primary);color:#fff;border-color:var(--accent-primary);transform:translateY(-1px)}.summary-bar{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:16px}.stat-card{background:var(--bg-tertiary);border-radius:var(--radius-md);padding:12px 16px;text-align:center;border:1px solid var(--border-color)}.stat-label{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-muted);margin-bottom:4px}.stat-value{font-size:1.25rem;font-weight:700;font-family:var(--font-mono);color:var(--text-primary)}.stat-value.positive{color:var(--positive)}.stat-value.negative{color:var(--negative)}.controls-row{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:12px}.search-container{position:relative;flex:1;max-width:400px}.search-container .search-icon{position:absolute;left:14px;top:50%;transform:translateY(-50%);color:var(--text-muted);font-size:14px}#searchInput{width:100%;padding:10px 40px;background:var(--bg-tertiary);border:1px solid var(--border-color);border-radius:var(--radius-md);font-size:14px;color:var(--text-primary);transition:all .2s}#searchInput:focus{outline:0;border-color:var(--accent-primary);box-shadow:0 0 0 3px rgba(59,130,246,.15)}#searchInput::placeholder{color:var(--text-muted)}.clear-search{position:absolute;right:10px;top:50%;transform:translateY(-50%);background:0 0;border:none;color:var(--text-muted);cursor:pointer;padding:4px;display:none}#searchInput:not(:placeholder-shown)+.clear-search{display:block}.control-group{display:flex;align-items:center;gap:10px}.refresh-rate{padding:10px 14px;background:var(--bg-tertiary);border:1px solid var(--border-color);border-radius:var(--radius-md);font-size:13px;color:var(--text-primary);cursor:pointer}.refresh-btn{display:flex;align-items:center;gap:8px;padding:10px 18px;background:linear-gradient(135deg,var(--accent-primary),var(--accent-secondary));border:none;border-radius:var(--radius-md);color:#fff;font-weight:600;font-size:14px;cursor:pointer;transition:all .2s}.refresh-btn:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(59,130,246,.4)}.refresh-icon.refreshing{animation:spin 1s linear infinite}@keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}.last-update{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-muted)}.section{background:var(--bg-secondary);border-radius:var(--radius-lg);margin-bottom:16px;box-shadow:var(--shadow-md);border:1px solid var(--border-color);overflow:hidden}.section-header{display:flex;justify-content:space-between;align-items:center;padding:16px 20px;background:var(--bg-tertiary);cursor:pointer;user-select:none;transition:background .2s}.section-header:hover{background:var(--border-color)}.section-header h2{display:flex;align-items:center;gap:10px;font-size:1rem;font-weight:600;color:var(--text-primary)}.section-header h2 i{color:var(--accent-primary)}.section-controls{display:flex;align-items:center;gap:10px}.section-count{background:var(--accent-primary);color:#fff;padding:2px 10px;border-radius:20px;font-size:12px;font-weight:600;font-family:var(--font-mono)}.section-toggle{color:var(--text-muted);transition:transform .3s}.section.collapsed .section-toggle{transform:rotate(-90deg)}.section.collapsed .section-content{display:none}.section-content{padding:0}.table-container{overflow-x:auto}table{width:100%;border-collapse:collapse}thead{position:sticky;top:0;z-index:10}th{padding:12px 14px;background:var(--bg-tertiary);color:var(--text-secondary);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px;text-align:right;border-bottom:2px solid var(--border-color);white-space:nowrap;position:relative}th:first-child{text-align:left;padding-left:20px}th.sortable{cursor:pointer;padding-right:28px}th.sortable:hover{color:var(--accent-primary)}th.sortable::after{content:'↕';position:absolute;right:10px;top:50%;transform:translateY(-50%);font-size:10px;color:var(--text-muted)}th.sortable.asc::after{content:'↑';color:var(--accent-primary)}th.sortable.desc::after{content:'↓';color:var(--accent-primary)}td{padding:14px;text-align:right;border-bottom:1px solid var(--border-light);font-size:14px;font-family:var(--font-mono)}td:first-child{text-align:left;padding-left:20px;font-weight:600;font-family:var(--font-sans)}tr{transition:background .15s}tr:hover{background:var(--bg-tertiary)}.symbol-link{color:var(--text-primary);text-decoration:none;display:inline-flex;align-items:center;gap:6px;transition:color .2s}.symbol-link:hover{color:var(--accent-primary)}.symbol-link .external-icon{opacity:0;font-size:10px;transition:opacity .2s}.symbol-link:hover .external-icon{opacity:1}.positive{color:var(--positive)!important}.negative{color:var(--negative)!important}.zero-shares{color:var(--negative);font-weight:700}.naked-puts{background:var(--warning-bg);color:var(--warning);font-weight:600;border-radius:4px;padding:4px 8px}.covered-calls{background:var(--positive-bg);color:var(--positive);font-weight:600;border-radius:4px;padding:4px 8px}.uncovered-calls{background:var(--negative-bg);color:var(--negative);font-weight:600;border-radius:4px;padding:4px 8px}.shares-available{background:var(--warning-bg);border-radius:4px;padding:4px 8px}.shares-negative{background:var(--negative-bg);color:var(--negative);font-weight:600;border-radius:4px;padding:4px 8px}tr.hidden{display:none}.no-results{padding:40px;text-align:center;color:var(--text-muted)}.skeleton-loader{padding:20px}.skeleton-row{height:48px;background:linear-gradient(90deg,var(--bg-tertiary) 25%,var(--border-color) 50%,var(--bg-tertiary) 75%);background-size:200% 100%;animation:shimmer 1.5s infinite;border-radius:var(--radius-sm);margin-bottom:8px}@keyframes shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}#toast-container{position:fixed;top:20px;right:20px;z-index:9999;display:flex;flex-direction:column;gap:10px}.toast{display:flex;align-items:center;gap:12px;padding:14px 20px;background:var(--bg-secondary);border:1px solid var(--border-color);border-radius:var(--radius-md);box-shadow:var(--shadow-lg);animation:slideIn .3s ease;min-width:280px}.toast.success{border-left:4px solid var(--positive)}.toast.error{border-left:4px solid var(--negative)}.toast.info{border-left:4px solid var(--accent-primary)}.toast-icon{font-size:18px}.toast.success .toast-icon{color:var(--positive)}.toast.error .toast-icon{color:var(--negative)}.toast.info .toast-icon{color:var(--accent-primary)}.toast-message{flex:1;font-size:14px;color:var(--text-primary)}.toast-close{background:0 0;border:none;color:var(--text-muted);cursor:pointer;padding:4px}@keyframes slideIn{from{transform:translateX(100%);opacity:0}to{transform:translateX(0);opacity:1}}@keyframes slideOut{from{transform:translateX(0);opacity:1}to{transform:translateX(100%);opacity:0}}.modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.5);backdrop-filter:blur(4px);z-index:10000;align-items:center;justify-content:center}.modal.active{display:flex}.modal-content{background:var(--bg-secondary);border-radius:var(--radius-lg);padding:24px;min-width:360px;box-shadow:var(--shadow-lg);border:1px solid var(--border-color)}.modal-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px}.modal-header h3{font-size:1.25rem;font-weight:600}.modal-close{background:0 0;border:none;font-size:24px;color:var(--text-muted);cursor:pointer}.shortcuts-list{display:flex;flex-direction:column;gap:12px}.shortcut{display:flex;align-items:center;gap:16px}kbd{display:inline-flex;align-items:center;justify-content:center;min-width:32px;padding:4px 10px;background:var(--bg-tertiary);border:1px solid var(--border-color);border-radius:6px;font-family:var(--font-mono);font-size:13px;font-weight:600;color:var(--text-primary)}.footer{display:flex;align-items:center;justify-content:center;gap:12px;padding:16px;color:var(--text-muted);font-size:12px}.footer-sep{color:var(--border-color)}#connectionStatus{display:flex;align-items:center;gap:6px}#connectionStatus.connected{color:var(--positive)}#connectionStatus.disconnected{color:var(--negative)}#connectionStatus.fallback{color:var(--warning)}.price-cell{display:inline-flex;align-items:center;gap:6px}.source-dot{display:inline-block;width:7px;height:7px;border-radius:50%;flex-shrink:0;position:relative;cursor:help}.source-dot.ibkr{background:var(--positive);box-shadow:0 0 4px var(--positive)}.source-dot.yahoo{background:var(--warning);box-shadow:0 0 4px var(--warning)}.source-dot.cached{background:var(--text-muted);box-shadow:0 0 4px var(--text-muted)}.source-dot.unavailable{background:var(--negative);box-shadow:0 0 4px var(--negative)}.price-stale{opacity:.7;font-style:italic}.price-tooltip{position:absolute;bottom:calc(100% + 8px);left:50%;transform:translateX(-50%);background:var(--bg-secondary);border:1px solid var(--border-color);border-radius:var(--radius-sm);padding:8px 12px;font-size:11px;font-family:var(--font-sans);font-style:normal;white-space:nowrap;box-shadow:var(--shadow-lg);z-index:100;pointer-events:none;opacity:0;transition:opacity .15s}.source-dot:hover .price-tooltip{opacity:1}.tooltip-source{font-weight:600;margin-bottom:2px}.tooltip-age{color:var(--text-muted)}.fallback-banner{background:linear-gradient(135deg,var(--warning),#d97706);color:#fff;padding:10px 20px;text-align:center;font-size:13px;font-weight:500;border-radius:var(--radius-md);margin-bottom:12px;display:flex;align-items:center;justify-content:center;gap:8px}@media (max-width:1024px){.summary-bar{grid-template-columns:repeat(3,1fr)}}@media (max-width:768px){.header-top{flex-direction:column;gap:16px}.summary-bar{grid-template-columns:repeat(2,1fr)}.controls-row{flex-direction:column}.search-container{max-width:100%}}'''
+    css = ''':root{--bg-primary:#f8fafc;--bg-secondary:#fff;--bg-tertiary:#f1f5f9;--text-primary:#1e293b;--text-secondary:#64748b;--text-muted:#94a3b8;--border-color:#e2e8f0;--border-light:#f1f5f9;--accent-primary:#3b82f6;--accent-secondary:#8b5cf6;--positive:#10b981;--positive-bg:#d1fae5;--negative:#ef4444;--negative-bg:#fee2e2;--warning:#f59e0b;--warning-bg:#fef3c7;--shadow-sm:0 1px 2px rgba(0,0,0,.05);--shadow-md:0 4px 6px -1px rgba(0,0,0,.1);--shadow-lg:0 10px 15px -3px rgba(0,0,0,.1);--radius-sm:6px;--radius-md:10px;--radius-lg:16px;--font-sans:'Plus Jakarta Sans',-apple-system,BlinkMacSystemFont,sans-serif;--font-mono:'JetBrains Mono','SF Mono',monospace}[data-theme=dark]{--bg-primary:#0f172a;--bg-secondary:#1e293b;--bg-tertiary:#334155;--text-primary:#f1f5f9;--text-secondary:#94a3b8;--text-muted:#64748b;--border-color:#334155;--border-light:#1e293b;--positive:#34d399;--positive-bg:rgba(16,185,129,.15);--negative:#f87171;--negative-bg:rgba(239,68,68,.15);--warning-bg:rgba(245,158,11,.15)}*{margin:0;padding:0;box-sizing:border-box}body{font-family:var(--font-sans);background:var(--bg-primary);color:var(--text-primary);min-height:100vh;transition:background-color .3s,color .3s}body.compact table td,body.compact table th{padding:6px 8px;font-size:13px}.container{max-width:1800px;margin:0 auto;padding:16px 20px}.header{background:var(--bg-secondary);border-radius:var(--radius-lg);padding:20px 24px;margin-bottom:20px;box-shadow:var(--shadow-md);border:1px solid var(--border-color)}.header-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}.brand{display:flex;align-items:center;gap:12px}.brand h1{font-size:1.75rem;font-weight:700;background:linear-gradient(135deg,var(--accent-primary),var(--accent-secondary));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}.version-badge{background:var(--bg-tertiary);color:var(--text-secondary);padding:4px 10px;border-radius:20px;font-size:12px;font-weight:500;font-family:var(--font-mono)}.header-actions{display:flex;align-items:center;gap:12px}.market-status{display:flex;align-items:center;gap:8px;padding:8px 14px;background:var(--bg-tertiary);border-radius:var(--radius-md);font-size:13px;font-weight:500}.market-status.open .status-dot{background:var(--positive);box-shadow:0 0 8px var(--positive)}.market-status.closed .status-dot{background:var(--negative)}.status-dot{width:8px;height:8px;border-radius:50%;background:var(--text-muted);animation:pulse 2s infinite}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}.status-countdown{font-family:var(--font-mono);color:var(--text-muted);font-size:12px}.icon-btn{width:40px;height:40px;display:flex;align-items:center;justify-content:center;background:var(--bg-tertiary);border:1px solid var(--border-color);border-radius:var(--radius-md);color:var(--text-secondary);cursor:pointer;transition:all .2s}.icon-btn:hover{background:var(--accent-primary);color:#fff;border-color:var(--accent-primary);transform:translateY(-1px)}.summary-bar{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:16px}.stat-card{background:var(--bg-tertiary);border-radius:var(--radius-md);padding:12px 16px;text-align:center;border:1px solid var(--border-color)}.stat-label{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-muted);margin-bottom:4px}.stat-value{font-size:1.25rem;font-weight:700;font-family:var(--font-mono);color:var(--text-primary)}.stat-value.positive{color:var(--positive)}.stat-value.negative{color:var(--negative)}.controls-row{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:12px}.search-container{position:relative;flex:1;max-width:400px}.search-container .search-icon{position:absolute;left:14px;top:50%;transform:translateY(-50%);color:var(--text-muted);font-size:14px}#searchInput{width:100%;padding:10px 40px;background:var(--bg-tertiary);border:1px solid var(--border-color);border-radius:var(--radius-md);font-size:14px;color:var(--text-primary);transition:all .2s}#searchInput:focus{outline:0;border-color:var(--accent-primary);box-shadow:0 0 0 3px rgba(59,130,246,.15)}#searchInput::placeholder{color:var(--text-muted)}.clear-search{position:absolute;right:10px;top:50%;transform:translateY(-50%);background:0 0;border:none;color:var(--text-muted);cursor:pointer;padding:4px;display:none}#searchInput:not(:placeholder-shown)+.clear-search{display:block}.control-group{display:flex;align-items:center;gap:10px}.refresh-rate{padding:10px 14px;background:var(--bg-tertiary);border:1px solid var(--border-color);border-radius:var(--radius-md);font-size:13px;color:var(--text-primary);cursor:pointer}.refresh-btn{display:flex;align-items:center;gap:8px;padding:10px 18px;background:linear-gradient(135deg,var(--accent-primary),var(--accent-secondary));border:none;border-radius:var(--radius-md);color:#fff;font-weight:600;font-size:14px;cursor:pointer;transition:all .2s}.refresh-btn:hover{transform:translateY(-1px);box-shadow:0 4px 12px rgba(59,130,246,.4)}.refresh-icon.refreshing{animation:spin 1s linear infinite}@keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}.last-update{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-muted)}.section{background:var(--bg-secondary);border-radius:var(--radius-lg);margin-bottom:16px;box-shadow:var(--shadow-md);border:1px solid var(--border-color);overflow:hidden}.section-header{display:flex;justify-content:space-between;align-items:center;padding:16px 20px;background:var(--bg-tertiary);cursor:pointer;user-select:none;transition:background .2s}.section-header:hover{background:var(--border-color)}.section-header h2{display:flex;align-items:center;gap:10px;font-size:1rem;font-weight:600;color:var(--text-primary)}.section-header h2 i{color:var(--accent-primary)}.section-controls{display:flex;align-items:center;gap:10px}.section-count{background:var(--accent-primary);color:#fff;padding:2px 10px;border-radius:20px;font-size:12px;font-weight:600;font-family:var(--font-mono)}.section-toggle{color:var(--text-muted);transition:transform .3s}.section.collapsed .section-toggle{transform:rotate(-90deg)}.section.collapsed .section-content{display:none}.section-content{padding:0}.table-container{overflow-x:auto}table{width:100%;border-collapse:collapse}thead{position:sticky;top:0;z-index:10}th{padding:12px 14px;background:var(--bg-tertiary);color:var(--text-secondary);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.5px;text-align:right;border-bottom:2px solid var(--border-color);white-space:nowrap;position:relative}th:first-child{text-align:left;padding-left:20px}th.sortable{cursor:pointer;padding-right:28px}th.sortable:hover{color:var(--accent-primary)}th.sortable::after{content:'↕';position:absolute;right:10px;top:50%;transform:translateY(-50%);font-size:10px;color:var(--text-muted)}th.sortable.asc::after{content:'↑';color:var(--accent-primary)}th.sortable.desc::after{content:'↓';color:var(--accent-primary)}td{padding:14px;text-align:right;border-bottom:1px solid var(--border-light);font-size:14px;font-family:var(--font-mono)}td:first-child{text-align:left;padding-left:20px;font-weight:600;font-family:var(--font-sans)}tr{transition:background .15s}tr:hover{background:var(--bg-tertiary)}.symbol-link{color:var(--text-primary);text-decoration:none;display:inline-flex;align-items:center;gap:6px;transition:color .2s}.symbol-link:hover{color:var(--accent-primary)}.symbol-link .external-icon{opacity:0;font-size:10px;transition:opacity .2s}.symbol-link:hover .external-icon{opacity:1}.positive{color:var(--positive)!important}.negative{color:var(--negative)!important}.zero-shares{color:var(--negative);font-weight:700}.naked-puts{background:var(--warning-bg);color:var(--warning);font-weight:600;border-radius:4px;padding:4px 8px}.covered-calls{background:var(--positive-bg);color:var(--positive);font-weight:600;border-radius:4px;padding:4px 8px}.uncovered-calls{background:var(--negative-bg);color:var(--negative);font-weight:600;border-radius:4px;padding:4px 8px}.shares-available{background:var(--warning-bg);border-radius:4px;padding:4px 8px}.shares-negative{background:var(--negative-bg);color:var(--negative);font-weight:600;border-radius:4px;padding:4px 8px}tr.hidden{display:none}.no-results{padding:40px;text-align:center;color:var(--text-muted)}.skeleton-loader{padding:20px}.skeleton-row{height:48px;background:linear-gradient(90deg,var(--bg-tertiary) 25%,var(--border-color) 50%,var(--bg-tertiary) 75%);background-size:200% 100%;animation:shimmer 1.5s infinite;border-radius:var(--radius-sm);margin-bottom:8px}@keyframes shimmer{0%{background-position:200% 0}100%{background-position:-200% 0}}#toast-container{position:fixed;top:20px;right:20px;z-index:9999;display:flex;flex-direction:column;gap:10px}.toast{display:flex;align-items:center;gap:12px;padding:14px 20px;background:var(--bg-secondary);border:1px solid var(--border-color);border-radius:var(--radius-md);box-shadow:var(--shadow-lg);animation:slideIn .3s ease;min-width:280px}.toast.success{border-left:4px solid var(--positive)}.toast.error{border-left:4px solid var(--negative)}.toast.info{border-left:4px solid var(--accent-primary)}.toast-icon{font-size:18px}.toast.success .toast-icon{color:var(--positive)}.toast.error .toast-icon{color:var(--negative)}.toast.info .toast-icon{color:var(--accent-primary)}.toast-message{flex:1;font-size:14px;color:var(--text-primary)}.toast-close{background:0 0;border:none;color:var(--text-muted);cursor:pointer;padding:4px}@keyframes slideIn{from{transform:translateX(100%);opacity:0}to{transform:translateX(0);opacity:1}}@keyframes slideOut{from{transform:translateX(0);opacity:1}to{transform:translateX(100%);opacity:0}}.modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.5);backdrop-filter:blur(4px);z-index:10000;align-items:center;justify-content:center}.modal.active{display:flex}.modal-content{background:var(--bg-secondary);border-radius:var(--radius-lg);padding:24px;min-width:360px;box-shadow:var(--shadow-lg);border:1px solid var(--border-color)}.modal-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px}.modal-header h3{font-size:1.25rem;font-weight:600}.modal-close{background:0 0;border:none;font-size:24px;color:var(--text-muted);cursor:pointer}.shortcuts-list{display:flex;flex-direction:column;gap:12px}.shortcut{display:flex;align-items:center;gap:16px}kbd{display:inline-flex;align-items:center;justify-content:center;min-width:32px;padding:4px 10px;background:var(--bg-tertiary);border:1px solid var(--border-color);border-radius:6px;font-family:var(--font-mono);font-size:13px;font-weight:600;color:var(--text-primary)}.footer{display:flex;align-items:center;justify-content:center;gap:12px;padding:16px;color:var(--text-muted);font-size:12px}.footer-sep{color:var(--border-color)}#connectionStatus{display:flex;align-items:center;gap:6px}#connectionStatus.connected{color:var(--positive)}#connectionStatus.disconnected{color:var(--negative)}#connectionStatus.fallback{color:var(--warning)}.price-cell{display:inline-flex;align-items:center;gap:6px}.source-dot{display:inline-block;width:7px;height:7px;border-radius:50%;flex-shrink:0;position:relative;cursor:help}.source-dot.ibkr{background:var(--positive);box-shadow:0 0 4px var(--positive)}.source-dot.yahoo{background:var(--warning);box-shadow:0 0 4px var(--warning)}.source-dot.cached{background:var(--text-muted);box-shadow:0 0 4px var(--text-muted)}.source-dot.unavailable{background:var(--negative);box-shadow:0 0 4px var(--negative)}.price-stale{opacity:.7;font-style:italic}.price-tooltip{position:absolute;bottom:calc(100% + 8px);left:50%;transform:translateX(-50%);background:var(--bg-secondary);border:1px solid var(--border-color);border-radius:var(--radius-sm);padding:8px 12px;font-size:11px;font-family:var(--font-sans);font-style:normal;white-space:nowrap;box-shadow:var(--shadow-lg);z-index:100;pointer-events:none;opacity:0;transition:opacity .15s}.source-dot:hover .price-tooltip{opacity:1}.tooltip-source{font-weight:600;margin-bottom:2px}.tooltip-age{color:var(--text-muted)}.fallback-banner{background:linear-gradient(135deg,var(--warning),#d97706);color:#fff;padding:10px 20px;text-align:center;font-size:13px;font-weight:500;border-radius:var(--radius-md);margin-bottom:12px;display:flex;align-items:center;justify-content:center;gap:8px}.fallback-why-link{color:#fff;text-decoration:underline;cursor:pointer;font-weight:600;background:0 0;border:none;padding:0;font-size:13px}.fallback-why-link:hover{opacity:.85}#connectionStatus.clickable{cursor:pointer;border-radius:var(--radius-sm);padding:2px 6px;transition:background .15s}#connectionStatus.clickable:hover{background:var(--bg-tertiary)}.diagnostics-modal-content{min-width:520px;max-width:720px;max-height:80vh;display:flex;flex-direction:column}.diagnostics-body{overflow-y:auto;flex:1}.diagnostics-loading{padding:24px;text-align:center;color:var(--text-muted)}.diag-section{margin-bottom:18px}.diag-section h4{font-size:12px;text-transform:uppercase;letter-spacing:.5px;color:var(--text-muted);margin-bottom:8px;font-weight:600}.diag-verdict{padding:14px 16px;border-radius:var(--radius-md);font-size:14px;line-height:1.5;border-left:4px solid var(--accent-primary);background:var(--bg-tertiary);color:var(--text-primary)}.diag-verdict.ok{border-left-color:var(--positive)}.diag-verdict.no_listener,.diag-verdict.handshake_timeout,.diag-verdict.client_id_in_use,.diag-verdict.unknown{border-left-color:var(--warning)}.diag-verdict-label{font-weight:700;margin-bottom:6px;display:block}.diag-table{width:100%;border-collapse:collapse;font-size:13px}.diag-table th,.diag-table td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--border-light);font-family:var(--font-mono)}.diag-table th{color:var(--text-muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.5px;font-family:var(--font-sans);background:var(--bg-tertiary)}.diag-status-pill{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;font-family:var(--font-sans)}.diag-status-pill.up{background:var(--positive-bg);color:var(--positive)}.diag-status-pill.down{background:var(--negative-bg);color:var(--negative)}.diag-meta-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px 16px;font-size:13px}.diag-meta-grid div{padding:6px 0;border-bottom:1px solid var(--border-light)}.diag-meta-label{color:var(--text-muted);font-size:11px;text-transform:uppercase;letter-spacing:.5px}.diag-meta-value{font-family:var(--font-mono);color:var(--text-primary);margin-top:2px;word-break:break-all}.diagnostics-footer{margin-top:16px;display:flex;justify-content:flex-end}@media (max-width:1024px){.summary-bar{grid-template-columns:repeat(3,1fr)}}@media (max-width:768px){.header-top{flex-direction:column;gap:16px}.summary-bar{grid-template-columns:repeat(2,1fr)}.controls-row{flex-direction:column}.search-container{max-width:100%}.diagnostics-modal-content{min-width:90vw}.diag-meta-grid{grid-template-columns:1fr}}'''
     with open(path, 'w', encoding='utf-8') as f:
         f.write(css)
     logger.info(f'Created: {path}')
@@ -1360,7 +1693,7 @@ def create_js_file(path):
     # Using readable JS for debugging - will help identify issues
     js = '''
 // TTC Positions Report - Frontend JavaScript
-// Version 2.0.4
+// Version 2.1.0
 
 let isRefreshing = false;
 let currentSort = { column: null, direction: "asc" };
@@ -1499,6 +1832,89 @@ function openShortcutsModal() {
 
 function closeShortcutsModal() {
     document.getElementById("shortcuts-modal").classList.remove("active");
+}
+
+function openDiagnosticsModal() {
+    document.getElementById("diagnostics-modal").classList.add("active");
+    loadDiagnostics();
+}
+
+function closeDiagnosticsModal() {
+    document.getElementById("diagnostics-modal").classList.remove("active");
+}
+
+function escapeHtml(s) {
+    if (s === null || s === undefined) return "";
+    return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\\"":"&quot;","'":"&#39;"})[c]);
+}
+
+async function loadDiagnostics() {
+    const body = document.getElementById("diagnostics-body");
+    body.innerHTML = '<div class="diagnostics-loading"><i class="fas fa-circle-notch fa-spin"></i> Running probe...</div>';
+    try {
+        const response = await fetch("/api/diagnostics");
+        const data = await response.json();
+        renderDiagnostics(data);
+    } catch (err) {
+        body.innerHTML = '<div class="diagnostics-loading">Could not load diagnostics: ' + escapeHtml(err.message) + '</div>';
+    }
+}
+
+function renderDiagnostics(data) {
+    const body = document.getElementById("diagnostics-body");
+    const verdict = data.verdict || "unknown";
+    const userMsg = data.user_message || "";
+    const breaker = data.breaker || {};
+    const cache = data.cache || {};
+    const lastSuccess = data.last_success || {};
+    const endpoints = data.endpoints || [];
+
+    const endpointRows = endpoints.map(ep => {
+        const status = ep.reachable
+            ? '<span class="diag-status-pill up">OPEN</span>'
+            : '<span class="diag-status-pill down">CLOSED</span>';
+        const err = ep.error ? escapeHtml(ep.error) : "";
+        return '<tr>' +
+            '<td>' + escapeHtml(ep.label) + '</td>' +
+            '<td>' + escapeHtml(ep.host) + ':' + escapeHtml(ep.port) + '</td>' +
+            '<td>' + status + '</td>' +
+            '<td>' + escapeHtml(ep.latency_ms) + ' ms</td>' +
+            '<td>' + err + '</td>' +
+            '</tr>';
+    }).join("");
+
+    const breakerLine = breaker.open
+        ? 'OPEN \u2014 retry in ' + (breaker.retry_in_seconds || 0) + 's (' + (breaker.consecutive_failures || 0) + ' consecutive failures)'
+        : 'closed (' + (breaker.consecutive_failures || 0) + ' recent failures)';
+
+    const lastSuccessLine = lastSuccess.timestamp
+        ? (lastSuccess.label || "?") + ' \u2014 ' + (lastSuccess.age || "")
+        : 'never this session';
+
+    body.innerHTML =
+        '<div class="diag-section">' +
+            '<div class="diag-verdict ' + escapeHtml(verdict) + '">' +
+                '<span class="diag-verdict-label">' + escapeHtml(verdict.replace(/_/g, " ").toUpperCase()) + '</span>' +
+                escapeHtml(userMsg) +
+            '</div>' +
+        '</div>' +
+        '<div class="diag-section">' +
+            '<h4>IBKR Endpoints</h4>' +
+            '<table class="diag-table">' +
+                '<thead><tr><th>Label</th><th>Address</th><th>Status</th><th>Latency</th><th>Error</th></tr></thead>' +
+                '<tbody>' + endpointRows + '</tbody>' +
+            '</table>' +
+        '</div>' +
+        '<div class="diag-section">' +
+            '<h4>State</h4>' +
+            '<div class="diag-meta-grid">' +
+                '<div><div class="diag-meta-label">Circuit Breaker</div><div class="diag-meta-value">' + escapeHtml(breakerLine) + '</div></div>' +
+                '<div><div class="diag-meta-label">Last Successful Connect</div><div class="diag-meta-value">' + escapeHtml(lastSuccessLine) + '</div></div>' +
+                '<div><div class="diag-meta-label">Cache</div><div class="diag-meta-value">' + escapeHtml(cache.symbols || 0) + ' symbols, ' + escapeHtml(cache.age || "n/a") + '</div></div>' +
+                '<div><div class="diag-meta-label">Client ID</div><div class="diag-meta-value">' + escapeHtml(data.client_id) + '</div></div>' +
+                '<div style="grid-column:1/-1"><div class="diag-meta-label">Platform</div><div class="diag-meta-value">' + escapeHtml(data.platform) + ' \u2014 App v' + escapeHtml(data.app_version) + '</div></div>' +
+            '</div>' +
+        '</div>';
 }
 
 function exportToCSV() {
@@ -1798,23 +2214,30 @@ function updateConnectionStatus(data) {
     if (existingBanner) existingBanner.remove();
     
     if (data.fallback) {
-        // Show fallback banner
+        // Show fallback banner with a "Why?" link to open diagnostics
         const banner = document.createElement("div");
         banner.className = "fallback-banner";
-        banner.innerHTML = '<i class="fas fa-exclamation-triangle"></i> ' + (data.fallback_message || "Using fallback data");
+        const msg = data.fallback_message || "Using fallback data";
+        banner.innerHTML = '<i class="fas fa-exclamation-triangle"></i> <span></span> <button type="button" class="fallback-why-link">Why?</button>';
+        banner.querySelector("span").textContent = msg;
+        banner.querySelector(".fallback-why-link").addEventListener("click", openDiagnosticsModal);
         const header = document.querySelector(".header");
         header.parentElement.insertBefore(banner, header.nextSibling);
-        
-        statusEl.className = "fallback";
+
+        statusEl.classList.remove("connected", "disconnected");
+        statusEl.classList.add("fallback", "clickable");
         statusEl.innerHTML = '<i class="fas fa-plug"></i> ' + (source === "yahoo" ? "Yahoo Finance" : "Cached Data");
     } else if (source === "ibkr") {
-        statusEl.className = "connected";
+        statusEl.classList.remove("disconnected", "fallback");
+        statusEl.classList.add("connected", "clickable");
         statusEl.innerHTML = '<i class="fas fa-plug"></i> IBKR Connected';
     } else if (source === "yahoo") {
-        statusEl.className = "fallback";
+        statusEl.classList.remove("connected", "disconnected");
+        statusEl.classList.add("fallback", "clickable");
         statusEl.innerHTML = '<i class="fas fa-plug"></i> Yahoo Finance';
     } else if (source === "cached") {
-        statusEl.className = "fallback";
+        statusEl.classList.remove("connected", "disconnected");
+        statusEl.classList.add("fallback", "clickable");
         statusEl.innerHTML = '<i class="fas fa-plug"></i> Cached Data';
     }
 }
@@ -1877,8 +2300,10 @@ async function updateTables() {
         log("Error: " + error.message);
         console.error("Fetch error:", error);
         showToast(error.message, "error");
-        document.getElementById("connectionStatus").className = "disconnected";
-        document.getElementById("connectionStatus").innerHTML = '<i class="fas fa-plug"></i> Connection Error';
+        const csEl = document.getElementById("connectionStatus");
+        csEl.classList.remove("connected", "fallback");
+        csEl.classList.add("disconnected", "clickable");
+        csEl.innerHTML = '<i class="fas fa-plug"></i> Connection Error';
     } finally {
         isRefreshing = false;
         setLoadingState(false);
@@ -1930,6 +2355,7 @@ document.addEventListener("keydown", (e) => {
             break;
         case "escape":
             closeShortcutsModal();
+            closeDiagnosticsModal();
             break;
     }
 });
@@ -1954,6 +2380,11 @@ document.addEventListener("DOMContentLoaded", () => {
     document.getElementById("shortcuts-modal").addEventListener("click", (e) => {
         if (e.target === document.getElementById("shortcuts-modal")) closeShortcutsModal();
     });
+    document.getElementById("connectionStatus").addEventListener("click", openDiagnosticsModal);
+    document.getElementById("diagnostics-modal").addEventListener("click", (e) => {
+        if (e.target === document.getElementById("diagnostics-modal")) closeDiagnosticsModal();
+    });
+    document.getElementById("diagnosticsRefreshBtn").addEventListener("click", loadDiagnostics);
     
     updateMarketStatus();
     marketStatusInterval = setInterval(updateMarketStatus, 60000);
