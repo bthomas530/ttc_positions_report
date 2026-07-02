@@ -96,19 +96,21 @@ jobs:
           pyinstaller --name "TTC Positions Report" `
             --onefile `
             --windowed `
+            --add-data "ui;ui" `
             --hidden-import=ib_async `
             --hidden-import=webview `
             --hidden-import=webview.platforms.winforms `
             --icon=installer/icon.ico `
             ttc_positions_app.py
         shell: pwsh
-      
+
       - name: Build with PyInstaller (without icon)
         if: steps.check_icon.outputs.ICON_EXISTS == 'false'
         run: |
           pyinstaller --name "TTC Positions Report" `
             --onefile `
             --windowed `
+            --add-data "ui;ui" `
             --hidden-import=ib_async `
             --hidden-import=webview `
             --hidden-import=webview.platforms.winforms `
@@ -170,6 +172,7 @@ jobs:
           pyinstaller --name "TTC Positions Report" \
             --onedir \
             --windowed \
+            --add-data "ui:ui" \
             --hidden-import=ib_async \
             --hidden-import=webview \
             --hidden-import=webview.platforms.cocoa \

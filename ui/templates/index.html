@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>TTC Positions Report</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div id="toast-container"></div>
+    <div id="shortcuts-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3>Keyboard Shortcuts</h3>
+                <button class="modal-close" onclick="closeShortcutsModal()">&times;</button>
+            </div>
+            <div class="shortcuts-list">
+                <div class="shortcut"><kbd>R</kbd> <span>Refresh data</span></div>
+                <div class="shortcut"><kbd>/</kbd> <span>Focus search</span></div>
+                <div class="shortcut"><kbd>D</kbd> <span>Toggle dark mode</span></div>
+                <div class="shortcut"><kbd>C</kbd> <span>Toggle compact view</span></div>
+                <div class="shortcut"><kbd>E</kbd> <span>Export to CSV</span></div>
+                <div class="shortcut"><kbd>1</kbd>-<kbd>4</kbd> <span>Switch tabs</span></div>
+                <div class="shortcut"><kbd>?</kbd> <span>Show shortcuts</span></div>
+                <div class="shortcut"><kbd>Esc</kbd> <span>Clear search / Close modal</span></div>
+            </div>
+        </div>
+    </div>
+    <div id="diagnostics-modal" class="modal">
+        <div class="modal-content diagnostics-modal-content">
+            <div class="modal-header">
+                <h3><i class="fas fa-stethoscope"></i> Connection Diagnostics</h3>
+                <button class="modal-close" onclick="closeDiagnosticsModal()">&times;</button>
+            </div>
+            <div id="diagnostics-body" class="diagnostics-body">
+                <div class="diagnostics-loading">Running probe...</div>
+            </div>
+            <div class="diagnostics-footer">
+                <button id="diagnosticsRefreshBtn" class="refresh-btn"><i class="fa-solid fa-arrows-rotate"></i> <span>Re-run probe</span></button>
+            </div>
+        </div>
+    </div>
+    <div class="container">
+        <header class="header">
+            <div class="header-top">
+                <div class="brand">
+                    <h1>TTC Positions</h1>
+                    <span class="version-badge">v{{ version }}</span>
+                </div>
+                <div class="header-actions">
+                    <div class="market-status" id="marketStatus">
+                        <span class="status-dot"></span>
+                        <span class="status-text">Checking...</span>
+                        <span class="status-countdown" id="marketCountdown"></span>
+                    </div>
+                    <button id="darkModeToggle" class="icon-btn" title="Toggle dark mode (D)"><i class="fas fa-moon"></i></button>
+                    <button id="compactToggle" class="icon-btn" title="Toggle compact view (C)"><i class="fas fa-compress-alt"></i></button>
+                    <button id="exportBtn" class="icon-btn" title="Export to CSV (E)"><i class="fas fa-download"></i></button>
+                    <button id="shortcutsBtn" class="icon-btn" title="Keyboard shortcuts (?)"><i class="fas fa-keyboard"></i></button>
+                </div>
+            </div>
+            <div class="summary-bar" id="summaryBar">
+                <div class="stat-card"><span class="stat-label">Positions</span><span class="stat-value" id="statPositions">--</span></div>
+                <div class="stat-card"><span class="stat-label">Daily P/L</span><span class="stat-value" id="statDailyPL">--</span></div>
+                <div class="stat-card"><span class="stat-label">Gainers</span><span class="stat-value positive" id="statGainers">--</span></div>
+                <div class="stat-card"><span class="stat-label">Losers</span><span class="stat-value negative" id="statLosers">--</span></div>
+                <div class="stat-card"><span class="stat-label">Watchlist</span><span class="stat-value" id="statWatchlist">--</span></div>
+            </div>
+            <nav class="tab-bar" id="tabBar">
+                <button class="tab-btn active" data-tab="positions" title="Positions (1)"><i class="fas fa-briefcase"></i> Positions</button>
+                <button class="tab-btn" data-tab="tranches" title="Tranches (2)"><i class="fas fa-layer-group"></i> Tranches</button>
+                <button class="tab-btn" data-tab="income" title="Income (3)"><i class="fas fa-sack-dollar"></i> Income</button>
+                <button class="tab-btn" data-tab="settings" title="Settings (4)"><i class="fas fa-gear"></i> Settings</button>
+            </nav>
+        </header>
+
+        <!-- ============ Positions tab ============ -->
+        <div class="tab-panel active" id="tab-positions">
+            <div class="controls-row">
+                <div class="search-container">
+                    <i class="fas fa-search search-icon"></i>
+                    <input type="text" id="searchInput" placeholder="Search symbols... ( / )">
+                    <button id="clearSearch" class="clear-search" title="Clear search (Esc)"><i class="fas fa-times"></i></button>
+                </div>
+                <div class="control-group">
+                    <select id="refreshRate" class="refresh-rate" title="Auto-refresh interval">
+                        <option value="0">Manual</option>
+                        <option value="15">15 sec</option>
+                        <option value="30">30 sec</option>
+                        <option value="60" selected>1 min</option>
+                        <option value="300">5 min</option>
+                    </select>
+                    <button id="refreshButton" class="refresh-btn" title="Refresh now (R)">
+                        <i class="fa-solid fa-arrows-rotate refresh-icon"></i>
+                        <span>Refresh</span>
+                    </button>
+                </div>
+            </div>
+            <div class="last-update" id="lastUpdate"><i class="far fa-clock"></i><span>Waiting for data...</span></div>
+            <div class="sections-container">
+                <section class="section" id="positions-section">
+                    <div class="section-header" onclick="toggleSection('positions')">
+                        <h2><i class="fas fa-briefcase"></i> Positions</h2>
+                        <div class="section-controls"><span class="section-count" id="positions-count">0</span><i class="fas fa-chevron-down section-toggle"></i></div>
+                    </div>
+                    <div class="section-content"><div class="table-container" id="positions-table"><div class="skeleton-loader"><div class="skeleton-row"></div><div class="skeleton-row"></div><div class="skeleton-row"></div></div></div></div>
+                </section>
+                <section class="section" id="incomplete-section">
+                    <div class="section-header" onclick="toggleSection('incomplete')">
+                        <h2><i class="fas fa-puzzle-piece"></i> Incomplete Lots</h2>
+                        <div class="section-controls"><span class="section-count" id="incomplete-count">0</span><i class="fas fa-chevron-down section-toggle"></i></div>
+                    </div>
+                    <div class="section-content"><div class="table-container" id="incomplete-table"><div class="skeleton-loader"><div class="skeleton-row"></div><div class="skeleton-row"></div></div></div></div>
+                </section>
+                <section class="section" id="watchlist-section">
+                    <div class="section-header" onclick="toggleSection('watchlist')">
+                        <h2><i class="fas fa-eye"></i> Watchlist</h2>
+                        <div class="section-controls"><span class="section-count" id="watchlist-count">0</span><i class="fas fa-chevron-down section-toggle"></i></div>
+                    </div>
+                    <div class="section-content"><div class="table-container" id="watchlist-table"><div class="skeleton-loader"><div class="skeleton-row"></div><div class="skeleton-row"></div></div></div></div>
+                </section>
+            </div>
+        </div>
+
+        <!-- ============ Tranches tab ============ -->
+        <div class="tab-panel" id="tab-tranches">
+            <div class="panel-toolbar">
+                <div class="panel-note"><i class="fas fa-layer-group"></i>
+                    Each tranche is a lot of shares tracked through the wheel: what it cost,
+                    the option premium collected against it, and what selling it would mean.
+                </div>
+                <button id="tranchesRefreshBtn" class="refresh-btn"><i class="fa-solid fa-arrows-rotate"></i> <span>Refresh</span></button>
+            </div>
+            <div id="tranches-content"><div class="skeleton-loader"><div class="skeleton-row"></div><div class="skeleton-row"></div></div></div>
+        </div>
+
+        <!-- ============ Income tab ============ -->
+        <div class="tab-panel" id="tab-income">
+            <div class="panel-toolbar">
+                <div class="panel-note"><i class="fas fa-sack-dollar"></i>
+                    Premium collected from selling puts and calls, and realized P/L from closed tranches.
+                </div>
+                <button id="incomeRefreshBtn" class="refresh-btn"><i class="fa-solid fa-arrows-rotate"></i> <span>Refresh</span></button>
+            </div>
+            <div id="income-content"><div class="skeleton-loader"><div class="skeleton-row"></div><div class="skeleton-row"></div></div></div>
+        </div>
+
+        <!-- ============ Settings tab ============ -->
+        <div class="tab-panel" id="tab-settings">
+            <div class="settings-grid">
+                <section class="section settings-card">
+                    <div class="section-header static"><h2><i class="fas fa-file-import"></i> IBKR Trade History (Flex Query)</h2></div>
+                    <div class="section-content settings-body">
+                        <p class="settings-help">
+                            Tranche and income tracking are built from your IBKR trade history,
+                            imported automatically once a day through IBKR's Flex Web Service.
+                            This needs a one-time setup in IBKR Client Portal (steps below).
+                            The token is stored only on this computer.
+                        </p>
+                        <div class="form-row">
+                            <label for="flexToken">Flex Web Service Token</label>
+                            <input type="password" id="flexToken" placeholder="Paste a new token to change it" autocomplete="off">
+                            <span class="form-hint" id="flexTokenHint"></span>
+                        </div>
+                        <div class="form-row">
+                            <label for="flexQueryId">Flex Query ID</label>
+                            <input type="text" id="flexQueryId" placeholder="e.g. 123456" autocomplete="off">
+                        </div>
+                        <div class="form-actions">
+                            <button id="saveFlexBtn" class="refresh-btn"><i class="fas fa-floppy-disk"></i> <span>Save</span></button>
+                            <button id="importNowBtn" class="refresh-btn secondary"><i class="fas fa-cloud-arrow-down"></i> <span>Import now</span></button>
+                        </div>
+                        <div class="import-status" id="importStatus"></div>
+                        <details class="flex-guide">
+                            <summary><i class="fas fa-circle-question"></i> How to set this up in IBKR (one time, about 5 minutes)</summary>
+                            <ol>
+                                <li>Log in to <strong>IBKR Client Portal</strong> at <code>www.interactivebrokers.com</code> (the website, not Trader Workstation).</li>
+                                <li>Open the menu and go to <strong>Performance &amp; Reports &rarr; Flex Queries</strong>.</li>
+                                <li>Under <strong>Activity Flex Query</strong>, click the <strong>+</strong> to create a new query.</li>
+                                <li>Name it <code>TTC Trades</code>. Under <strong>Sections</strong>, pick <strong>Trades</strong> and check: Executions; select <em>all fields</em> (or at least: Symbol, Underlying Symbol, Asset Class, Buy/Sell, Quantity, Trade Price, Proceeds, Commission, Trade Date, Date/Time, Open/Close Indicator, Notes/Codes, Strike, Expiry, Put/Call, Multiplier, Trade ID, Order ID).</li>
+                                <li>Under <strong>Delivery Configuration</strong>: Period = <strong>Last 365 Calendar Days</strong>, Format = XML.</li>
+                                <li>Save the query and note the <strong>Query ID</strong> number shown in the list — that goes in the box above.</li>
+                                <li>Now go to <strong>Settings &rarr; Account Settings</strong>, find <strong>Flex Web Service</strong>, turn it on, and <strong>generate a token</strong>. Copy the long token string into the box above.</li>
+                                <li>Click <strong>Save</strong>, then <strong>Import now</strong>. Done — from now on it imports by itself.</li>
+                            </ol>
+                        </details>
+                    </div>
+                </section>
+                <section class="section settings-card">
+                    <div class="section-header static"><h2><i class="fas fa-sliders"></i> Trading Preferences</h2></div>
+                    <div class="section-content settings-body">
+                        <div class="form-row">
+                            <label for="buybackThreshold">Buyback alert threshold (% of premium remaining)</label>
+                            <input type="number" id="buybackThreshold" min="1" max="100" step="1">
+                            <span class="form-hint">Short options are highlighted when their remaining premium falls to this percentage — e.g. 15 means "85% of the premium is already yours".</span>
+                        </div>
+                        <div class="form-row">
+                            <label for="weeklyGoal">Weekly premium goal ($)</label>
+                            <input type="number" id="weeklyGoal" min="0" step="50">
+                            <span class="form-hint">Shown on the Income tab. Set 0 to hide.</span>
+                        </div>
+                        <div class="form-actions">
+                            <button id="savePrefsBtn" class="refresh-btn"><i class="fas fa-floppy-disk"></i> <span>Save</span></button>
+                        </div>
+                    </div>
+                </section>
+                <section class="section settings-card">
+                    <div class="section-header static"><h2><i class="fas fa-database"></i> Data</h2></div>
+                    <div class="section-content settings-body">
+                        <div class="data-info" id="dataInfo"></div>
+                        <div class="form-actions">
+                            <button id="exportDataBtn" class="refresh-btn secondary"><i class="fas fa-file-export"></i> <span>Export data for support</span></button>
+                        </div>
+                        <span class="form-hint">Copies the database and CSV files into an <code>export</code> folder next to the app (syncs via Dropbox) so Brandon can look at it remotely.</span>
+                    </div>
+                </section>
+            </div>
+        </div>
+
+        <footer class="footer">
+            <span>TTC Positions Report v{{ version }}</span>
+            <span class="footer-sep">|</span>
+            <span id="connectionStatus" class="clickable" title="Click for connection diagnostics"><i class="fas fa-plug"></i> IBKR</span>
+        </footer>
+    </div>
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/tranches.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/income.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/settings.js') }}"></script>
+</body>
+</html>

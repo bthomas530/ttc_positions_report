@@ -35,8 +35,8 @@ echo
 if [ -n "$1" ] && [ "$1" != "--build-only" ]; then
     VERSION="$1"
 else
-    # Extract version from ttc_positions_app.py
-    VERSION=$(grep 'APP_VERSION = ' ttc_positions_app.py | cut -d'"' -f2)
+    # Extract version from ttc_app/config.py
+    VERSION=$(grep 'APP_VERSION = ' ttc_app/config.py | cut -d'"' -f2)
 fi
 
 echo -e "${YELLOW}Version: ${VERSION}${NC}"
@@ -49,7 +49,7 @@ if [ "$1" != "--build-only" ]; then
     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
         read -p "Enter new version: " VERSION
         # Update version in the Python file
-        sed -i '' "s/APP_VERSION = \".*\"/APP_VERSION = \"$VERSION\"/" ttc_positions_app.py
+        sed -i '' "s/APP_VERSION = \".*\"/APP_VERSION = \"$VERSION\"/" ttc_app/config.py
         echo -e "${GREEN}Updated version to $VERSION${NC}"
     fi
 fi
@@ -74,13 +74,13 @@ fi
 echo -e "${YELLOW}Cleaning previous builds...${NC}"
 rm -rf "$DIST_DIR" "$BUILD_DIR"
 
-# Build the app
+# Build the app (ui/ templates+static are bundled into the app)
 echo -e "${YELLOW}Building application...${NC}"
 pyinstaller \
     --name "$APP_NAME" \
     --onedir \
     --windowed \
-    --add-data "resources:resources" \
+    --add-data "ui:ui" \
     --hidden-import="ib_async" \
     --hidden-import="webview" \
     --hidden-import="webview.platforms.cocoa" \
@@ -90,17 +90,6 @@ pyinstaller \
 if [ -f "icon.icns" ]; then
     echo -e "${YELLOW}Adding icon to app bundle...${NC}"
     cp icon.icns "$DIST_DIR/$APP_NAME.app/Contents/Resources/"
-fi
-
-# Create resources folder alongside the app
-echo -e "${YELLOW}Creating external resources folder...${NC}"
-mkdir -p "$DIST_DIR/resources/templates"
-mkdir -p "$DIST_DIR/resources/static/css"
-mkdir -p "$DIST_DIR/resources/static/js"
-
-# Copy resources if they exist
-if [ -d "resources" ]; then
-    cp -r resources/* "$DIST_DIR/resources/"
 fi
 
 # Create a DMG (disk image) for distribution

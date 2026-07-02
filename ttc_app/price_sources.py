@@ -3,18 +3,13 @@
 
 import json
 import logging
-import os
 import ssl
 import urllib.error
 import urllib.request
 
-from datetime import datetime, timedelta
-
 logger = logging.getLogger(__name__)
 
 USER_AGENT = 'TTC-Positions-Report'
-
-QUAL_FAILURE_TTL_HOURS = 24
 
 # Use certifi's CA bundle when available (needed on macOS dev setups where
 # Python lacks system certs); production Windows uses the OS cert store.
@@ -154,60 +149,3 @@ def fetch_cboe_prices(symbols, user_agent=USER_AGENT):
         logger.info(f'Cboe fallback: got prices for {len(results)}/{len(valid_symbols)} symbols')
 
     return results
-
-
-class QualFailureCache:
-    """Remembers symbols that failed IBKR contract qualification so they are
-    skipped (and sent straight to Yahoo/Stooq) until the TTL expires."""
-
-    def __init__(self, path, ttl_hours=QUAL_FAILURE_TTL_HOURS):
-        self.path = path
-        self.ttl = timedelta(hours=ttl_hours)
-        self._entries = {}
-        self._load()
-
-    def _load(self):
-        if os.path.exists(self.path):
-            try:
-                with open(self.path, 'r') as f:
-                    self._entries = json.load(f)
-            except Exception as e:
-                logger.warning(f'Could not load qualification-failure cache: {e}')
-                self._entries = {}
-
-    def _save(self):
-        try:
-            with open(self.path, 'w') as f:
-                json.dump(self._entries, f, indent=2)
-        except Exception as e:
-            logger.warning(f'Could not save qualification-failure cache: {e}')
-
-    def is_failed(self, symbol, now=None):
-        entry = self._entries.get(symbol)
-        if not entry:
-            return False
-        now = now or datetime.now()
-        try:
-            last_failed = datetime.fromisoformat(entry['last_failed'])
-        except (KeyError, ValueError):
-            return False
-        if now - last_failed >= self.ttl:
-            return False
-        return True
-
-    def record_failure(self, symbol, reason='', now=None):
-        now = now or datetime.now()
-        entry = self._entries.get(symbol, {'fail_count': 0})
-        entry['fail_count'] = entry.get('fail_count', 0) + 1
-        entry['last_failed'] = now.isoformat()
-        entry['reason'] = str(reason)[:200]
-        self._entries[symbol] = entry
-        self._save()
-
-    def record_success(self, symbol):
-        if symbol in self._entries:
-            del self._entries[symbol]
-            self._save()
-
-    def failed_symbols(self, now=None):
-        return [s for s in self._entries if self.is_failed(s, now)]

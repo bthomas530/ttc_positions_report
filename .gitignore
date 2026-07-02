@@ -40,10 +40,12 @@ Thumbs.db
 # Local config (if contains sensitive data)
 # ttc_watchlist.json
 
-# Generated static files (app recreates these)
-static/
-templates/
-resources/
+# Legacy generated static files (pre-2.3.0 runtime resources, root only)
+/static/
+/templates/
+/resources/
+/resources_old_backup*/
+/export/
 
 # Installer output
 installer/*.exe
@@ -56,3 +58,6 @@ price_cache.json
 version.json
 app_settings.json
 qual_failures.json
+
+# Local deployment helper (contains a private local path; repo is public)
+/deploy_to_dad.sh
