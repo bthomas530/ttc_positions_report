@@ -29,11 +29,39 @@ env:
 
 jobs:
   # ============================================
+  # Run Tests (Windows + Mac)
+  # ============================================
+  test:
+    strategy:
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run tests
+        run: pytest tests/ -v
+
+  # ============================================
   # Build Windows Executable
   # ============================================
   build-windows:
+    needs: test
     runs-on: windows-latest
-    
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -103,18 +131,22 @@ jobs:
         run: |
           $version = "${{ steps.version.outputs.VERSION }}"
           Move-Item "dist/TTC Positions Report.exe" "dist/TTC_Positions_Report_${version}_Windows.exe"
+          # Stable-named copy: the in-app updater downloads this asset so the
+          # download URL and checksum lookup don't depend on the version string
+          Copy-Item "dist/TTC_Positions_Report_${version}_Windows.exe" "dist/TTC_Positions_Report_Windows.exe"
         shell: pwsh
-      
+
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
           name: windows-build
-          path: dist/TTC_Positions_Report_*_Windows.exe
+          path: dist/TTC_Positions_Report_*Windows.exe
 
   # ============================================
   # Build Mac Application
   # ============================================
   build-mac:
+    needs: test
     runs-on: macos-latest
     
     steps:
@@ -207,7 +239,13 @@ jobs:
       
       - name: List files
         run: ls -la dist/
-      
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
       - name: Create Release
         id: create_release
         uses: softprops/action-gh-release@v1
@@ -228,8 +266,9 @@ jobs:
             ### What's New
             See commit history for changes.
           files: |
-            dist/TTC_Positions_Report_*_Windows.exe
+            dist/TTC_Positions_Report_*Windows.exe
             dist/TTC_Positions_Report_*_Mac.dmg
+            dist/SHA256SUMS.txt
           draft: false
           prerelease: false
         env:

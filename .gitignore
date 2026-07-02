@@ -50,3 +50,9 @@ installer/*.exe
 installer/*.ico
 installer/*.icns
 
+
+# Runtime state files (created next to the app)
+price_cache.json
+version.json
+app_settings.json
+qual_failures.json
