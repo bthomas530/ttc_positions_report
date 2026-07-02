@@ -34,7 +34,7 @@ if "%~1"=="--build-only" (
 
 REM Get version from Python file if not specified
 if "%VERSION%"=="" (
-    for /f "tokens=2 delims='=" %%a in ('findstr "APP_VERSION = " ttc_positions_app.py') do (
+    for /f "tokens=2 delims='=" %%a in ('findstr "APP_VERSION = " ttc_app\config.py') do (
         set "VERSION=%%a"
         set "VERSION=!VERSION:"=!"
         set "VERSION=!VERSION: =!"
@@ -67,13 +67,13 @@ echo Cleaning previous builds...
 if exist "%DIST_DIR%" rmdir /s /q "%DIST_DIR%"
 if exist "%BUILD_DIR%" rmdir /s /q "%BUILD_DIR%"
 
-REM Build the app
+REM Build the app (ui/ templates+static are bundled into the exe)
 echo Building application...
 pyinstaller ^
     --name "%APP_NAME%" ^
     --onefile ^
     --windowed ^
-    --add-data "resources;resources" ^
+    --add-data "ui;ui" ^
     --hidden-import=ib_async ^
     --hidden-import=webview ^
     --hidden-import=webview.platforms.winforms ^
@@ -82,23 +82,6 @@ pyinstaller ^
 if errorlevel 1 (
     echo Build failed!
     exit /b 1
-)
-
-REM Add icon if exists
-if exist "installer\icon.ico" (
-    echo Adding icon...
-    REM Icon is embedded by PyInstaller if specified in spec file
-)
-
-REM Create resources folder alongside the exe
-echo Creating external resources folder...
-mkdir "%DIST_DIR%\resources\templates" 2>nul
-mkdir "%DIST_DIR%\resources\static\css" 2>nul
-mkdir "%DIST_DIR%\resources\static\js" 2>nul
-
-REM Copy resources if they exist
-if exist "resources" (
-    xcopy /s /y "resources\*" "%DIST_DIR%\resources\"
 )
 
 echo.

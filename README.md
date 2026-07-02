@@ -317,12 +317,10 @@ When you want to release a new version:
 
 ### Step 1: Update Version Number
 
-Edit `ttc_positions_app.py`:
+Edit `ttc_app/config.py` (single source of truth — the UI reads it automatically):
 ```python
-APP_VERSION = "2.1.0"  # Increment this
+APP_VERSION = "2.4.0"  # Increment this
 ```
-
-Also update in the HTML (search for `version-badge` and `TTC Positions Report v`).
 
 ### Step 2: Commit and Tag
 

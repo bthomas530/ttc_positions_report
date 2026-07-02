@@ -17,7 +17,7 @@ import time
 
 from datetime import datetime, timedelta
 
-from ib_async import IB, Stock
+from ib_async import IB, Stock, Contract
 
 logger = logging.getLogger(__name__)
 
@@ -183,8 +183,10 @@ class IBKRManager:
         self.connected_endpoint = None   # (host, port, label)
         self.next_retry_at = None        # datetime
 
-        self._contracts = {}             # symbol -> qualified Contract
-        self._tickers = {}               # symbol -> Ticker
+        self._contracts = {}             # symbol -> qualified stock Contract
+        self._tickers = {}               # symbol -> stock Ticker
+        self._opt_contracts = {}         # conId -> qualified option Contract
+        self._opt_tickers = {}           # conId -> option Ticker
         self._last_snapshot = None
         self._last_snapshot_time = 0
 
@@ -360,6 +362,13 @@ class IBKRManager:
                 self._tickers[symbol] = self._ib.reqMktData(self._contracts[symbol])
             except Exception as e:
                 logger.warning(f'Could not resubscribe {symbol}: {e}')
+        conids = list(self._opt_contracts.keys())
+        self._opt_tickers.clear()
+        for conid in conids:
+            try:
+                self._opt_tickers[conid] = self._ib.reqMktData(self._opt_contracts[conid])
+            except Exception as e:
+                logger.warning(f'Could not resubscribe option {conid}: {e}')
 
     def _record_failure(self, error):
         self.consecutive_failures += 1
@@ -418,6 +427,7 @@ class IBKRManager:
 
             positions_raw = []
             desired_symbols = set(watchlist_symbols)
+            option_positions = {}  # conId -> position info
             for position in positions:
                 contract = position.contract
                 positions_raw.append({
@@ -426,11 +436,19 @@ class IBKRManager:
                     'right': getattr(contract, 'right', ''),
                     'position': position.position,
                     'avgCost': float(position.avgCost) if position.avgCost else 0,
+                    'conId': contract.conId,
                 })
                 if contract.secType in ('STK', 'OPT'):
                     desired_symbols.add(contract.symbol)
+                if contract.secType == 'OPT' and position.position and contract.conId:
+                    option_positions[contract.conId] = {
+                        'position': position.position,
+                        'avgCost': float(position.avgCost) if position.avgCost else 0,
+                        'symbol': contract.symbol,
+                    }
 
             failed_symbols = await self._ensure_subscriptions(desired_symbols)
+            options = await self._ensure_option_subscriptions(option_positions)
 
             now_str = datetime.now().isoformat()
             market_data = {}
@@ -454,10 +472,102 @@ class IBKRManager:
                 'positions_raw': positions_raw,
                 'market_data': market_data,
                 'failed_symbols': failed_symbols,
+                'options': options,
             }
             self._last_snapshot = snapshot
             self._last_snapshot_time = time.time()
             return snapshot
+
+    async def _ensure_option_subscriptions(self, option_positions):
+        """Maintain standing subscriptions for option positions (by conId) and
+        read mark + model greeks. Returns a list of option row dicts."""
+        # Drop subscriptions for options no longer held
+        for conid in list(self._opt_tickers.keys()):
+            if conid not in option_positions:
+                try:
+                    self._ib.cancelMktData(self._opt_contracts[conid])
+                except Exception:
+                    pass
+                self._opt_tickers.pop(conid, None)
+                self._opt_contracts.pop(conid, None)
+
+        # Qualify + subscribe new option positions
+        new_tickers = []
+        for conid, info in option_positions.items():
+            if conid in self._opt_tickers:
+                continue
+            contract = self._opt_contracts.get(conid)
+            if contract is None:
+                try:
+                    stub = Contract(conId=conid, exchange='SMART')
+                    qualified = await self._ib.qualifyContractsAsync(stub)
+                    if not qualified or not qualified[0].conId:
+                        logger.info(f'Could not qualify option conId={conid} '
+                                    f'({info.get("symbol")})')
+                        continue
+                    contract = qualified[0]
+                    self._opt_contracts[conid] = contract
+                except Exception as e:
+                    logger.warning(f'Error qualifying option conId={conid}: {e}')
+                    continue
+            try:
+                ticker = self._ib.reqMktData(contract)
+                self._opt_tickers[conid] = ticker
+                new_tickers.append(ticker)
+            except Exception as e:
+                logger.warning(f'Error requesting option market data conId={conid}: {e}')
+
+        # Wait for first data on new option tickers (greeks can lag the price)
+        if new_tickers:
+            deadline = time.time() + FIRST_PRICE_DEADLINE
+            while time.time() < deadline:
+                if all(safe_price(t.marketPrice()) > 0 or t.modelGreeks
+                       for t in new_tickers):
+                    break
+                await asyncio.sleep(0.2)
+
+        options = []
+        today = datetime.now().date()
+        for conid, info in option_positions.items():
+            ticker = self._opt_tickers.get(conid)
+            contract = self._opt_contracts.get(conid)
+            if ticker is None or contract is None:
+                continue
+            greeks = ticker.modelGreeks
+            expiry_raw = contract.lastTradeDateOrContractMonth or ''
+            expiry = None
+            dte = None
+            if len(expiry_raw) >= 8:
+                try:
+                    expiry_date = datetime.strptime(expiry_raw[:8], '%Y%m%d').date()
+                    expiry = expiry_date.isoformat()
+                    dte = (expiry_date - today).days
+                except ValueError:
+                    pass
+            multiplier = safe_price(contract.multiplier) or 100
+            mark = safe_price(ticker.marketPrice())
+            if mark <= 0:
+                mark = safe_price(ticker.last) or safe_price(ticker.close)
+            options.append({
+                'conId': conid,
+                'symbol': contract.symbol,
+                'localSymbol': contract.localSymbol,
+                'right': contract.right,
+                'strike': safe_price(contract.strike),
+                'expiry': expiry,
+                'dte': dte,
+                'position': info['position'],
+                'multiplier': multiplier,
+                'entry_price': (info['avgCost'] / multiplier) if multiplier else 0,
+                'mark': mark,
+                'delta': safe_price(greeks.delta) if greeks else None,
+                'gamma': safe_price(greeks.gamma) if greeks else None,
+                'theta': safe_price(greeks.theta) if greeks else None,
+                'vega': safe_price(greeks.vega) if greeks else None,
+                'iv': safe_price(greeks.impliedVol) if greeks else None,
+                'und_price': safe_price(greeks.undPrice) if greeks else None,
+            })
+        return options
 
     async def _ensure_subscriptions(self, desired_symbols):
         """Diff standing subscriptions against the desired set.
@@ -542,6 +652,6 @@ class IBKRManager:
                 'port': last_endpoint[1] if last_endpoint else None,
                 'label': last_endpoint[2] if last_endpoint else None,
             },
-            'subscriptions': len(self._tickers),
+            'subscriptions': len(self._tickers) + len(self._opt_tickers),
             'probes': list(self.last_probes),
         }

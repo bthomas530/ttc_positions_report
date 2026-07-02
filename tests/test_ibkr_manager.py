@@ -5,7 +5,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ibkr_manager import (
+from ttc_app.ibkr_manager import (
     BACKOFF_CAP,
     IBKRManager,
     classify_handshake_error,
