@@ -61,26 +61,40 @@ class TestProbe:
         assert results[0]['reachable'] is False
         assert results[0]['error']
 
-    def test_probe_treats_would_block_as_reachable(self):
-        # A non-blocking connect_ex() that is still mid-handshake when our
-        # timeout expires returns WSAEWOULDBLOCK (10035) on Windows -- this
-        # has been observed for TWS ports that are genuinely open. It must
-        # not be reported as "closed", or the manager will never even try
-        # a real ib_async connection.
+    def test_probe_resolves_pending_connect_via_select(self):
+        # connect_ex() on a non-blocking socket returns EINPROGRESS/
+        # WSAEWOULDBLOCK immediately for a handshake still in flight -- on
+        # Windows this happens for genuinely open AND genuinely closed ports,
+        # so the errno alone can't tell them apart (a prior fix that assumed
+        # otherwise broke test_probe_closed_port on Windows CI). select()
+        # must be used to wait for the real outcome via SO_ERROR.
         mock_sock = MagicMock()
-        mock_sock.connect_ex.return_value = 10035
-        with patch('socket.socket', return_value=mock_sock):
+        mock_sock.connect_ex.return_value = 36  # EINPROGRESS
+        mock_sock.getsockopt.return_value = 0   # SO_ERROR: connected
+        with patch('socket.socket', return_value=mock_sock), \
+             patch('select.select', return_value=([], [mock_sock], [])):
             results = probe_ib_ports([('127.0.0.1', 7496, 'TWS Live')], timeout=0.1)
         assert results[0]['reachable'] is True
         assert results[0]['error'] is None
 
-    def test_probe_still_rejects_connection_refused(self):
+    def test_probe_still_rejects_connection_refused_via_select(self):
         mock_sock = MagicMock()
-        mock_sock.connect_ex.return_value = 61  # ECONNREFUSED (macOS)
-        with patch('socket.socket', return_value=mock_sock):
+        mock_sock.connect_ex.return_value = 36  # EINPROGRESS
+        mock_sock.getsockopt.return_value = 61  # SO_ERROR: ECONNREFUSED (macOS)
+        with patch('socket.socket', return_value=mock_sock), \
+             patch('select.select', return_value=([], [], [mock_sock])):
             results = probe_ib_ports([('127.0.0.1', 7496, 'TWS Live')], timeout=0.1)
         assert results[0]['reachable'] is False
         assert results[0]['error'] == 'connection refused'
+
+    def test_probe_true_timeout_when_select_never_resolves(self):
+        mock_sock = MagicMock()
+        mock_sock.connect_ex.return_value = 36  # EINPROGRESS
+        with patch('socket.socket', return_value=mock_sock), \
+             patch('select.select', return_value=([], [], [])):
+            results = probe_ib_ports([('127.0.0.1', 7496, 'TWS Live')], timeout=0.1)
+        assert results[0]['reachable'] is False
+        assert results[0]['error'] == 'timeout'
 
 
 class TestManagerStatus:

@@ -8,10 +8,10 @@
 # reconnects with backoff when TWS goes away.
 
 import asyncio
-import errno
 import logging
 import math
 import random
+import select
 import socket
 import threading
 import time
@@ -28,17 +28,6 @@ DEFAULT_ENDPOINTS = [
     ("127.0.0.1", 4001, "Gateway Live"),
     ("127.0.0.1", 4002, "Gateway Paper"),
 ]
-
-# Non-blocking connect_ex() codes meaning "handshake still in flight when our
-# timeout expired" rather than "refused". A genuinely closed port on loopback
-# refuses almost instantly (WSAECONNREFUSED/ECONNREFUSED); it never leaves the
-# connect in this pending state. Windows in particular has been observed
-# returning WSAEWOULDBLOCK for TWS ports that are, in fact, open and
-# accepting -- treating these as "closed" produces false NoListenerErrors.
-INPROGRESS_ERRNOS = {
-    10035, 10036,  # WSAEWOULDBLOCK, WSAEINPROGRESS (Windows)
-    errno.EINPROGRESS, errno.EALREADY, errno.EWOULDBLOCK, errno.EAGAIN,
-}
 
 CONNECT_TIMEOUT = 4       # seconds for ib_async handshake
 PROBE_TIMEOUT = 1.0       # seconds for socket pre-check
@@ -85,7 +74,15 @@ def probe_ib_ports(endpoints=None, timeout=None):
     """Fast TCP pre-check for each IBKR endpoint.
 
     Returns a list of dicts: [{host, port, label, reachable, latency_ms, error}].
-    Uses socket.connect_ex which returns in ~5 ms when a port is closed on loopback.
+
+    Uses a non-blocking connect + select() rather than socket.settimeout(),
+    which is unreliable for this on Windows: connect_ex() on a blocking
+    socket with a timeout can return WSAEWOULDBLOCK (10035) -- "still in
+    progress" -- for both open and closed ports once the timeout elapses,
+    making it impossible to tell them apart from the return code alone.
+    select() lets us wait for the socket to become writable (or, on
+    Windows, show up as exceptional -- how Windows signals a failed
+    connect) and then read the real outcome via SO_ERROR.
     """
     if endpoints is None:
         endpoints = DEFAULT_ENDPOINTS
@@ -96,14 +93,22 @@ def probe_ib_ports(endpoints=None, timeout=None):
     for host, port, label in endpoints:
         start = time.time()
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
+        sock.setblocking(False)
+        reachable = False
         err_code = None
         err_msg = None
         try:
             err_code = sock.connect_ex((host, port))
-        except socket.timeout:
-            err_code = -1
-            err_msg = 'timeout'
+            if err_code == 0:
+                reachable = True
+            else:
+                _, writable, exceptional = select.select([], [sock], [sock], timeout)
+                if writable or exceptional:
+                    err_code = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                    reachable = (err_code == 0)
+                else:
+                    err_code = -1
+                    err_msg = 'timeout'
         except Exception as e:
             err_code = -1
             err_msg = str(e)
@@ -114,7 +119,7 @@ def probe_ib_ports(endpoints=None, timeout=None):
                 pass
         latency_ms = int((time.time() - start) * 1000)
 
-        if err_code == 0 or err_code in INPROGRESS_ERRNOS:
+        if reachable:
             results.append({
                 'host': host, 'port': port, 'label': label,
                 'reachable': True, 'latency_ms': latency_ms, 'error': None,

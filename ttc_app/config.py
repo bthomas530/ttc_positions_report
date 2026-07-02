@@ -14,7 +14,7 @@ import platform
 import sys
 
 APP_NAME = "TTC Positions Report"
-APP_VERSION = "2.3.1"
+APP_VERSION = "2.3.2"
 USER_AGENT = f'{APP_NAME}/{APP_VERSION}'
 
 DEFAULT_PORT = 8082
