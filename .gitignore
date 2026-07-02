@@ -58,3 +58,6 @@ price_cache.json
 version.json
 app_settings.json
 qual_failures.json
+
+# Local deployment helper (contains a private local path; repo is public)
+/deploy_to_dad.sh
