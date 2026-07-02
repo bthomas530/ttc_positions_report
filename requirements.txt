@@ -1,7 +1,6 @@
 # TTC Positions Report - Dependencies
 
 # IBKR connection
-ib-insync>=0.9.70
 ib_async>=1.0.3
 
 # Web framework
