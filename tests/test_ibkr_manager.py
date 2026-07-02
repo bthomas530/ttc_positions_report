@@ -2,6 +2,7 @@ import asyncio
 import math
 import os
 import sys
+from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -59,6 +60,27 @@ class TestProbe:
         assert len(results) == 1
         assert results[0]['reachable'] is False
         assert results[0]['error']
+
+    def test_probe_treats_would_block_as_reachable(self):
+        # A non-blocking connect_ex() that is still mid-handshake when our
+        # timeout expires returns WSAEWOULDBLOCK (10035) on Windows -- this
+        # has been observed for TWS ports that are genuinely open. It must
+        # not be reported as "closed", or the manager will never even try
+        # a real ib_async connection.
+        mock_sock = MagicMock()
+        mock_sock.connect_ex.return_value = 10035
+        with patch('socket.socket', return_value=mock_sock):
+            results = probe_ib_ports([('127.0.0.1', 7496, 'TWS Live')], timeout=0.1)
+        assert results[0]['reachable'] is True
+        assert results[0]['error'] is None
+
+    def test_probe_still_rejects_connection_refused(self):
+        mock_sock = MagicMock()
+        mock_sock.connect_ex.return_value = 61  # ECONNREFUSED (macOS)
+        with patch('socket.socket', return_value=mock_sock):
+            results = probe_ib_ports([('127.0.0.1', 7496, 'TWS Live')], timeout=0.1)
+        assert results[0]['reachable'] is False
+        assert results[0]['error'] == 'connection refused'
 
 
 class TestManagerStatus:

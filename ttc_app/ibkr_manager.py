@@ -8,6 +8,7 @@
 # reconnects with backoff when TWS goes away.
 
 import asyncio
+import errno
 import logging
 import math
 import random
@@ -28,8 +29,19 @@ DEFAULT_ENDPOINTS = [
     ("127.0.0.1", 4002, "Gateway Paper"),
 ]
 
+# Non-blocking connect_ex() codes meaning "handshake still in flight when our
+# timeout expired" rather than "refused". A genuinely closed port on loopback
+# refuses almost instantly (WSAECONNREFUSED/ECONNREFUSED); it never leaves the
+# connect in this pending state. Windows in particular has been observed
+# returning WSAEWOULDBLOCK for TWS ports that are, in fact, open and
+# accepting -- treating these as "closed" produces false NoListenerErrors.
+INPROGRESS_ERRNOS = {
+    10035, 10036,  # WSAEWOULDBLOCK, WSAEINPROGRESS (Windows)
+    errno.EINPROGRESS, errno.EALREADY, errno.EWOULDBLOCK, errno.EAGAIN,
+}
+
 CONNECT_TIMEOUT = 4       # seconds for ib_async handshake
-PROBE_TIMEOUT = 0.25      # seconds for socket pre-check
+PROBE_TIMEOUT = 1.0       # seconds for socket pre-check
 HEARTBEAT_INTERVAL = 30   # seconds between reqCurrentTime keepalives
 HEARTBEAT_TIMEOUT = 5
 BACKOFF_BASE = 2          # reconnect backoff: 2s, 4s, 8s ... capped
@@ -102,7 +114,7 @@ def probe_ib_ports(endpoints=None, timeout=None):
                 pass
         latency_ms = int((time.time() - start) * 1000)
 
-        if err_code == 0:
+        if err_code == 0 or err_code in INPROGRESS_ERRNOS:
             results.append({
                 'host': host, 'port': port, 'label': label,
                 'reachable': True, 'latency_ms': latency_ms, 'error': None,
