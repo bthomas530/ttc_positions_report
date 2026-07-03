@@ -1,6 +1,5 @@
 
 // TTC Positions Report - Frontend JavaScript (core + Positions tab)
-// Version 2.3.0
 
 let isRefreshing = false;
 let currentSort = { column: null, direction: "asc" };
@@ -8,8 +7,15 @@ let refreshInterval;
 let cachedData = null;
 let optionsBySymbol = {};
 let marketStatusInterval;
+let lastConnectionSource = null;
 const PREFS_KEY = "ttc_positions_prefs";
 const loadedTabs = { positions: true };
+
+const DEFAULT_NOTIFICATION_PREFS = {
+    enabled: true,
+    position: "bottom-right",
+    categories: { refresh: false, dataSource: true, actions: true, errors: true },
+};
 
 // Debug logging
 function log(msg) {
@@ -32,6 +38,32 @@ function savePreferences(prefs) {
     }
 }
 
+function getNotificationPrefs() {
+    const saved = loadPreferences().notifications || {};
+    return {
+        ...DEFAULT_NOTIFICATION_PREFS,
+        ...saved,
+        categories: { ...DEFAULT_NOTIFICATION_PREFS.categories, ...(saved.categories || {}) },
+    };
+}
+
+function saveNotificationPrefs(partial) {
+    const current = getNotificationPrefs();
+    savePreferences({
+        notifications: {
+            ...current,
+            ...partial,
+            categories: { ...current.categories, ...(partial.categories || {}) },
+        },
+    });
+}
+
+function applyToastPosition(notif) {
+    const container = document.getElementById("toast-container");
+    container.classList.toggle("position-top-right", notif.position !== "bottom-right");
+    container.classList.toggle("position-bottom-right", notif.position === "bottom-right");
+}
+
 function applyPreferences() {
     const prefs = loadPreferences();
     if (prefs.darkMode) {
@@ -50,9 +82,15 @@ function applyPreferences() {
             if (el) el.classList.add("collapsed");
         });
     }
+    applyToastPosition(getNotificationPrefs());
 }
 
-function showToast(message, type = "info", duration = 3000) {
+// category: "refresh" (routine auto-refresh pings), "dataSource" (IBKR/fallback
+// transitions), "actions" (explicit user-initiated feedback), "errors"
+function showToast(message, type = "info", duration = 3000, category = "actions") {
+    const notif = getNotificationPrefs();
+    if (!notif.enabled || notif.categories[category] === false) return;
+
     const container = document.getElementById("toast-container");
     const toast = document.createElement("div");
     toast.className = "toast " + type;
@@ -228,7 +266,7 @@ function renderDiagnostics(data) {
 
 function exportToCSV() {
     if (!cachedData) {
-        showToast("No data to export", "error");
+        showToast("No data to export", "error", 3000, "errors");
         return;
     }
     let csv = ["Symbol","Shares","Current Price","Avg Price","Daily Change $","Daily Change %","Last Price","Open","OGap","NP","CC","UC","Shares Available","Data Source"].join(",") + "\n";
@@ -597,6 +635,26 @@ function setLoadingState(loading) {
     }
 }
 
+const SOURCE_LABELS = {
+    ibkr: "IBKR", yahoo: "Yahoo Finance", cboe: "Cboe",
+    cached: "cached data", unavailable: "unavailable",
+};
+
+// Toasts only on an actual IBKR<->fallback transition, not on every poll --
+// updateConnectionStatus() already shows the current source persistently.
+function notifyDataSourceChange(data) {
+    const source = data.connection_source || "ibkr";
+    if (lastConnectionSource !== null && lastConnectionSource !== source) {
+        if (data.fallback) {
+            showToast(data.fallback_message || ("Switched to " + (SOURCE_LABELS[source] || source)),
+                "info", 4000, "dataSource");
+        } else {
+            showToast("Reconnected to IBKR", "success", 3000, "dataSource");
+        }
+    }
+    lastConnectionSource = source;
+}
+
 function updateConnectionStatus(data) {
     const statusEl = document.getElementById("connectionStatus");
     const source = data.connection_source || "ibkr";
@@ -688,16 +746,15 @@ async function updateTables() {
         const searchVal = document.getElementById("searchInput").value;
         if (searchVal) filterTables(searchVal);
         
-        if (data.fallback) {
-            showToast(data.fallback_message || "Using fallback data", "info", 3000);
-        } else {
-            showToast("Data refreshed", "success", 1500);
+        notifyDataSourceChange(data);
+        if (!data.fallback) {
+            showToast("Data refreshed", "success", 1500, "refresh");
         }
-        
+
     } catch (error) {
         log("Error: " + error.message);
         console.error("Fetch error:", error);
-        showToast(error.message, "error");
+        showToast(error.message, "error", 3000, "errors");
         const csEl = document.getElementById("connectionStatus");
         csEl.classList.remove("connected", "fallback");
         csEl.classList.add("disconnected", "clickable");

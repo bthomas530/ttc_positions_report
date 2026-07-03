@@ -50,6 +50,7 @@ Thumbs.db
 # Installer output
 installer/*.exe
 installer/*.ico
+!installer/icon.ico
 installer/*.icns
 
 

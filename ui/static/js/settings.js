@@ -121,7 +121,42 @@ async function exportData() {
     }
 }
 
+function loadNotificationSettings() {
+    const notif = getNotificationPrefs();
+    document.getElementById("notifEnabled").checked = notif.enabled;
+    document.getElementById("notifPosition").value = notif.position;
+    document.getElementById("notifDataSource").checked = notif.categories.dataSource;
+    document.getElementById("notifActions").checked = notif.categories.actions;
+    document.getElementById("notifErrors").checked = notif.categories.errors;
+    document.getElementById("notifRefresh").checked = notif.categories.refresh;
+    document.getElementById("notifSubOptions").classList.toggle("disabled", !notif.enabled);
+}
+
 document.addEventListener("DOMContentLoaded", () => {
+    loadNotificationSettings();
+
+    document.getElementById("notifEnabled").addEventListener("change", (e) => {
+        saveNotificationPrefs({ enabled: e.target.checked });
+        document.getElementById("notifSubOptions").classList.toggle("disabled", !e.target.checked);
+        applyToastPosition(getNotificationPrefs());
+    });
+    document.getElementById("notifPosition").addEventListener("change", (e) => {
+        saveNotificationPrefs({ position: e.target.value });
+        applyToastPosition(getNotificationPrefs());
+    });
+    document.getElementById("notifDataSource").addEventListener("change", (e) => {
+        saveNotificationPrefs({ categories: { dataSource: e.target.checked } });
+    });
+    document.getElementById("notifActions").addEventListener("change", (e) => {
+        saveNotificationPrefs({ categories: { actions: e.target.checked } });
+    });
+    document.getElementById("notifErrors").addEventListener("change", (e) => {
+        saveNotificationPrefs({ categories: { errors: e.target.checked } });
+    });
+    document.getElementById("notifRefresh").addEventListener("change", (e) => {
+        saveNotificationPrefs({ categories: { refresh: e.target.checked } });
+    });
+
     document.getElementById("saveFlexBtn").addEventListener("click", () => {
         saveSettings({
             flex_token: document.getElementById("flexToken").value.trim(),

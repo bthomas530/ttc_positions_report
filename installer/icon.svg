@@ -7,14 +7,11 @@
   </defs>
   <!-- Background circle -->
   <circle cx="128" cy="128" r="120" fill="url(#grad)"/>
-  <!-- Chart bars -->
-  <rect x="50" y="140" width="30" height="60" rx="4" fill="white" opacity="0.9"/>
-  <rect x="90" y="100" width="30" height="100" rx="4" fill="white" opacity="0.9"/>
-  <rect x="130" y="80" width="30" height="120" rx="4" fill="white" opacity="0.9"/>
-  <rect x="170" y="60" width="30" height="140" rx="4" fill="white" opacity="0.9"/>
-  <!-- Trend line -->
-  <path d="M 55 130 Q 100 110, 145 75 T 195 55" stroke="white" stroke-width="6" fill="none" stroke-linecap="round"/>
-  <!-- Arrow head -->
-  <polygon points="195,55 180,52 183,67" fill="white"/>
+  <!-- House: roof + body, a door cut through to the gradient -->
+  <polygon points="70,148 128,92 186,148" fill="white" opacity="0.95"/>
+  <rect x="82" y="148" width="92" height="64" rx="6" fill="white" opacity="0.95"/>
+  <rect x="117" y="178" width="22" height="34" rx="2" fill="url(#grad)"/>
+  <!-- Growth line, arcing clear over the roofline -->
+  <path d="M 50 180 Q 90 40, 210 45" stroke="white" stroke-width="9" fill="none" stroke-linecap="round"/>
+  <polygon points="210,45 195,42 198,57" fill="white"/>
 </svg>
-

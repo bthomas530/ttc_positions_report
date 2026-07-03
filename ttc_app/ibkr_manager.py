@@ -508,25 +508,34 @@ class IBKRManager:
                 self._opt_tickers.pop(conid, None)
                 self._opt_contracts.pop(conid, None)
 
-        # Qualify + subscribe new option positions
+        # Qualify new option positions concurrently (one batched call instead
+        # of one round-trip per conId -- serial qualification of a large
+        # portfolio was blowing past the get_snapshot() timeout on cold start)
+        to_qualify = {
+            conid: Contract(conId=conid, exchange='SMART')
+            for conid in option_positions
+            if conid not in self._opt_tickers and conid not in self._opt_contracts
+        }
+        if to_qualify:
+            try:
+                await self._ib.qualifyContractsAsync(*to_qualify.values())
+            except Exception as e:
+                logger.warning(f'Error qualifying option contracts: {e}')
+            for conid, stub in to_qualify.items():
+                if stub.conId:
+                    self._opt_contracts[conid] = stub
+                else:
+                    logger.info(f'Could not qualify option conId={conid} '
+                                f'({option_positions[conid].get("symbol")})')
+
+        # Subscribe new option positions
         new_tickers = []
         for conid, info in option_positions.items():
             if conid in self._opt_tickers:
                 continue
             contract = self._opt_contracts.get(conid)
             if contract is None:
-                try:
-                    stub = Contract(conId=conid, exchange='SMART')
-                    qualified = await self._ib.qualifyContractsAsync(stub)
-                    if not qualified or not qualified[0].conId:
-                        logger.info(f'Could not qualify option conId={conid} '
-                                    f'({info.get("symbol")})')
-                        continue
-                    contract = qualified[0]
-                    self._opt_contracts[conid] = contract
-                except Exception as e:
-                    logger.warning(f'Error qualifying option conId={conid}: {e}')
-                    continue
+                continue
             try:
                 ticker = self._ib.reqMktData(contract)
                 self._opt_tickers[conid] = ticker
@@ -601,23 +610,28 @@ class IBKRManager:
                 self._tickers.pop(symbol, None)
                 self._contracts.pop(symbol, None)
 
-        # Qualify + subscribe new symbols
-        new_tickers = []
+        # Qualify new symbols concurrently (one batched call instead of one
+        # round-trip per symbol -- serial qualification of a large portfolio
+        # was blowing past the get_snapshot() timeout on cold start)
+        to_qualify = []
         for symbol in sorted(desired_symbols):
-            if symbol in self._tickers:
+            if symbol in self._tickers or symbol in self._contracts:
                 continue
             if self._qual_cache and self._qual_cache.is_failed(symbol):
                 failed.append(symbol)
                 continue
+            to_qualify.append(symbol)
+        if to_qualify:
+            await self._qualify_many(to_qualify, failed)
+
+        # Subscribe new symbols
+        new_tickers = []
+        for symbol in sorted(desired_symbols):
+            if symbol in self._tickers or symbol in failed:
+                continue
             contract = self._contracts.get(symbol)
             if contract is None:
-                contract = await self._qualify(symbol)
-                if contract is None:
-                    failed.append(symbol)
-                    continue
-                self._contracts[symbol] = contract
-                if self._qual_cache:
-                    self._qual_cache.record_success(symbol)
+                continue
             try:
                 ticker = self._ib.reqMktData(contract)
                 self._tickers[symbol] = ticker
@@ -636,20 +650,34 @@ class IBKRManager:
 
         return failed
 
-    async def _qualify(self, symbol):
-        """Qualify a stock contract; retry without SMART for odd listings."""
-        for exchange in ('SMART', ''):
+    async def _qualify_many(self, symbols, failed):
+        """Qualify many stock contracts in one batched, concurrent call;
+        retry stragglers once without SMART for odd listings."""
+        contracts = {symbol: Stock(symbol, 'SMART', 'USD') for symbol in symbols}
+        try:
+            await self._ib.qualifyContractsAsync(*contracts.values())
+        except Exception as e:
+            logger.debug(f'Error qualifying contracts (SMART): {e}')
+
+        stragglers = [s for s, c in contracts.items() if not c.conId]
+        if stragglers:
+            retry = {s: Stock(s, '', 'USD') for s in stragglers}
             try:
-                contract = Stock(symbol, exchange, 'USD')
-                qualified = await self._ib.qualifyContractsAsync(contract)
-                if qualified and qualified[0].conId:
-                    return qualified[0]
+                await self._ib.qualifyContractsAsync(*retry.values())
             except Exception as e:
-                logger.debug(f'Error qualifying {symbol} ({exchange or "no exchange"}): {e}')
-        logger.info(f'Contract qualification failed for {symbol}')
-        if self._qual_cache:
-            self._qual_cache.record_failure(symbol, 'qualification failed')
-        return None
+                logger.debug(f'Error qualifying contracts (no exchange): {e}')
+            contracts.update(retry)
+
+        for symbol, contract in contracts.items():
+            if contract.conId:
+                self._contracts[symbol] = contract
+                if self._qual_cache:
+                    self._qual_cache.record_success(symbol)
+            else:
+                logger.info(f'Contract qualification failed for {symbol}')
+                if self._qual_cache:
+                    self._qual_cache.record_failure(symbol, 'qualification failed')
+                failed.append(symbol)
 
     # ---------- diagnostics ----------
 
