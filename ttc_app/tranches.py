@@ -1,8 +1,12 @@
 # Tranche/wheel engine: pure functions, no I/O.
 #
 # Rebuilds the full tranche picture from the immutable trades table every time
-# (derived data is never patched incrementally). A "tranche" is a lot of shares
-# — normally 100, matching one option contract — tracked through the wheel:
+# (derived data is never patched incrementally). A tranche always matches a
+# real purchase/assignment lot exactly (whatever size that trade actually was)
+# — it is never pre-chunked into 100-share pieces up front. It only ever
+# splits when something forces a boundary smaller than the whole lot: a
+# covered call needs exactly 100 shares, or a sell/assignment closes fewer
+# shares than the lot holds. Tracked through the wheel:
 #
 #   short put sold -> assigned  => tranche opened at the strike, put premium
 #                                  attributed to the tranche
@@ -113,26 +117,25 @@ class _Engine:
         source = 'PUT_ASSIGNMENT' if assigned else 'BUY'
         total_cash = _amount(trade)
 
-        # Split into 100-share lots plus an odd remainder
-        lots = [LOT_SIZE] * (qty // LOT_SIZE)
-        if qty % LOT_SIZE:
-            lots.append(qty % LOT_SIZE)
-
-        new_tranches = []
-        for lot in lots:
-            cash_share = total_cash * (lot / qty)
-            tranche = self.new_tranche(symbol, lot, ts, price, source, cash_share)
-            self.event(symbol, 'OPEN', ts, amount=cash_share, qty=lot,
-                       tranche=tranche, exec_id=trade['exec_id'],
-                       details=f'{source} @ {price}')
-            new_tranches.append(tranche)
+        # One trade = one tranche, matching the real purchase/assignment lot
+        # exactly -- never pre-chunked into 100-share pieces here. Coverage
+        # splitting (when a covered call needs exactly 100 shares) happens
+        # on demand in _call_sold, not eagerly at purchase time.
+        tranche = self.new_tranche(symbol, qty, ts, price, source, total_cash)
+        self.event(symbol, 'OPEN', ts, amount=total_cash, qty=qty,
+                   tranche=tranche, exec_id=trade['exec_id'],
+                   details=f'{source} @ {price}')
 
         if assigned:
-            self._attach_assigned_put_premium(state, trade, new_tranches, ts)
+            self._attach_assigned_put_premium(state, trade, [tranche], ts)
 
     def _attach_assigned_put_premium(self, state, trade, new_tranches, ts):
-        """Attribute the assigned put's net premium to the tranches it opened."""
-        contracts_needed = sum(1 for t in new_tranches if t['qty'] == LOT_SIZE)
+        """Attribute the assigned put's net premium to the tranche(s) it opened,
+        proportional to each tranche's share of the total assigned quantity
+        (in practice there's exactly one tranche, sized to a whole number of
+        contracts, since assignment quantity is always a multiple of 100)."""
+        total_qty = sum(t['qty'] for t in new_tranches)
+        contracts_needed = total_qty // LOT_SIZE
         if contracts_needed == 0:
             return
         premium = 0.0
@@ -170,9 +173,8 @@ class _Engine:
 
         if premium == 0:
             return
-        full_lots = [t for t in new_tranches if t['qty'] == LOT_SIZE]
-        for tranche in full_lots:
-            share = premium / len(full_lots)
+        for tranche in new_tranches:
+            share = premium * (tranche['qty'] / total_qty)
             tranche['premium'] += share
             self.event(tranche['symbol'], 'PUT_ASSIGNED', ts, amount=share,
                        qty=1, tranche=tranche, exec_id=trade['exec_id'],
@@ -330,7 +332,10 @@ class _Engine:
         })
 
     def _call_sold(self, trade):
-        """Covered call: attribute premium directly to the tranches it covers."""
+        """Covered call: attribute premium to exactly 100 shares per contract.
+        A lot larger than 100 (a real purchase of e.g. 500 shares) is split
+        on demand so only the covered slice becomes its own tranche -- the
+        rest of the original purchase lot stays intact as one open tranche."""
         symbol = trade['symbol']
         state = self.state(symbol)
         key = _call_key(trade)
@@ -339,19 +344,23 @@ class _Engine:
         per_contract = total / contracts if contracts else 0
 
         covered = 0
-        for tranche in state.open_tranches:
-            if covered >= contracts:
+        while covered < contracts:
+            candidate = next(
+                (t for t in state.open_tranches
+                 if t['_call_key'] is None and t['qty'] >= LOT_SIZE), None)
+            if candidate is None:
                 break
-            if tranche['qty'] >= LOT_SIZE and tranche['_call_key'] is None:
-                tranche['_call_key'] = key
-                tranche['covering_call'] = {'strike': trade.get('strike'),
-                                            'expiry': trade.get('expiry')}
-                tranche['premium'] += per_contract
-                self.event(symbol, 'CALL_SOLD', trade['trade_ts'],
-                           amount=per_contract, qty=1, tranche=tranche,
-                           exec_id=trade['exec_id'],
-                           details=f"{trade.get('strike')} {trade.get('expiry')}")
-                covered += 1
+            if candidate['qty'] > LOT_SIZE:
+                candidate = self._split_tranche(candidate, LOT_SIZE)
+            candidate['_call_key'] = key
+            candidate['covering_call'] = {'strike': trade.get('strike'),
+                                          'expiry': trade.get('expiry')}
+            candidate['premium'] += per_contract
+            self.event(symbol, 'CALL_SOLD', trade['trade_ts'],
+                       amount=per_contract, qty=1, tranche=candidate,
+                       exec_id=trade['exec_id'],
+                       details=f"{trade.get('strike')} {trade.get('expiry')}")
+            covered += 1
 
         uncovered = contracts - covered
         if uncovered > 0:
@@ -449,32 +458,54 @@ def _seed_unexplained(engine, current_positions):
         if missing <= 0:
             continue
         avg_cost = position.get('avgCost') or 0
-        lots = [LOT_SIZE] * (missing // LOT_SIZE)
-        if missing % LOT_SIZE:
-            lots.append(missing % LOT_SIZE)
-        for lot in lots:
-            tranche = engine.new_tranche(symbol, lot, None, avg_cost, 'SEEDED',
-                                         -(lot * avg_cost), inferred=1)
-            engine.event(symbol, 'OPEN', now_iso, amount=-(lot * avg_cost),
-                         qty=lot, tranche=tranche,
-                         details='seeded from IBKR avgCost (pre-history)')
+        # One seeded tranche for the whole unexplained remainder -- there's no
+        # real lot boundary to preserve here (pre-history), and on-demand
+        # splitting in _call_sold will still carve out 100-share coverage
+        # slices from it later if a covered call is written against part of it.
+        tranche = engine.new_tranche(symbol, missing, None, avg_cost, 'SEEDED',
+                                     -(missing * avg_cost), inferred=1)
+        engine.event(symbol, 'OPEN', now_iso, amount=-(missing * avg_cost),
+                     qty=missing, tranche=tranche,
+                     details='seeded from IBKR avgCost (pre-history)')
 
 
-def income_summary(events, closed_tranches):
-    """Aggregate premium income by ISO week and month, plus assignment history.
+#: which event_type values represent each way a sold option can resolve --
+#: used for the Income tab's outcome breakdown (expired worthless vs bought
+#: back early vs assigned). Not the same set as premium_types below: this is
+#: about *how* a position resolved, not how much cash it moved.
+OUTCOME_EVENT_TYPES = {
+    'expired': {'PUT_EXPIRED', 'CALL_EXPIRED'},
+    'bought_back': {'PUT_CLOSED', 'CALL_CLOSED'},
+    'assigned': {'PUT_ASSIGNED'},
+}
 
-    Premium events count their cash amount; realized stock P/L comes from
-    closed tranches (which already include attributed premium — reported
-    separately so the two aren't double-counted in the UI)."""
+
+def income_summary(events, closed_tranches, weekly_goal=0, monthly_goal=0):
+    """Aggregate premium income by ISO week/month/symbol, an outcome
+    breakdown (expired/bought-back/assigned), goal-streaks, and assignment
+    history. Realized stock P/L comes from closed tranches (which already
+    include attributed premium — reported separately so the two aren't
+    double-counted in the UI)."""
     premium_types = {'PUT_SOLD', 'PUT_CLOSED', 'CALL_SOLD', 'CALL_CLOSED',
                      'PUT_ASSIGNED'}
     weekly = {}
     monthly = {}
+    by_symbol = {}
+    outcomes = {k: {'count': 0, 'amount': 0.0} for k in OUTCOME_EVENT_TYPES}
+
     for event in events:
-        if event['event_type'] not in premium_types or not event.get('ts'):
+        event_type = event['event_type']
+        amount = event['amount'] or 0
+
+        for outcome, types in OUTCOME_EVENT_TYPES.items():
+            if event_type in types:
+                outcomes[outcome]['count'] += 1
+                outcomes[outcome]['amount'] += amount
+
+        if event_type not in premium_types or not event.get('ts'):
             continue
         # PUT_ASSIGNED re-attributes premium already counted at PUT_SOLD
-        if event['event_type'] == 'PUT_ASSIGNED':
+        if event_type == 'PUT_ASSIGNED':
             continue
         try:
             when = datetime.fromisoformat(event['ts'])
@@ -483,8 +514,14 @@ def income_summary(events, closed_tranches):
         iso = when.isocalendar()
         week_label = f'{iso[0]}-W{iso[1]:02d}'
         month_label = when.strftime('%Y-%m')
-        weekly[week_label] = weekly.get(week_label, 0) + (event['amount'] or 0)
-        monthly[month_label] = monthly.get(month_label, 0) + (event['amount'] or 0)
+        weekly[week_label] = weekly.get(week_label, 0) + amount
+        monthly[month_label] = monthly.get(month_label, 0) + amount
+        symbol = event.get('symbol')
+        if symbol:
+            by_symbol[symbol] = by_symbol.get(symbol, 0) + amount
+
+    for outcome in outcomes.values():
+        outcome['amount'] = round(outcome['amount'], 2)
 
     assignments = [e for e in events
                    if e['event_type'] in ('PUT_ASSIGNED', 'CLOSE')
@@ -492,11 +529,29 @@ def income_summary(events, closed_tranches):
 
     realized = sum(t['realized_pl'] or 0 for t in closed_tranches)
 
+    def streak(periods, goal):
+        """Consecutive most-recent periods (newest first) meeting goal."""
+        if goal <= 0:
+            return None
+        count = 0
+        for _, amount in periods:
+            if amount >= goal:
+                count += 1
+            else:
+                break
+        return count
+
+    weekly_sorted = sorted(weekly.items(), reverse=True)
+    monthly_sorted = sorted(monthly.items(), reverse=True)
+
     return {
-        'weekly_premium': [{'period': k, 'amount': round(v, 2)}
-                           for k, v in sorted(weekly.items(), reverse=True)],
-        'monthly_premium': [{'period': k, 'amount': round(v, 2)}
-                            for k, v in sorted(monthly.items(), reverse=True)],
+        'weekly_premium': [{'period': k, 'amount': round(v, 2)} for k, v in weekly_sorted],
+        'monthly_premium': [{'period': k, 'amount': round(v, 2)} for k, v in monthly_sorted],
         'realized_pl_closed': round(realized, 2),
         'assignments': assignments,
+        'by_symbol': [{'symbol': s, 'premium': round(v, 2)}
+                      for s, v in sorted(by_symbol.items(), key=lambda kv: -kv[1])],
+        'outcomes': outcomes,
+        'weekly_streak': streak(weekly_sorted, weekly_goal),
+        'monthly_streak': streak(monthly_sorted, monthly_goal),
     }

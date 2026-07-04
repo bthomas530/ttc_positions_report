@@ -12,6 +12,7 @@ async function loadSettings() {
             : "No token saved yet.";
         document.getElementById("buybackThreshold").value = data.buyback_threshold_pct;
         document.getElementById("weeklyGoal").value = data.weekly_premium_goal || 0;
+        document.getElementById("monthlyGoal").value = data.monthly_premium_goal || 0;
 
         const info = document.getElementById("dataInfo");
         const last = data.last_import;
@@ -167,6 +168,7 @@ document.addEventListener("DOMContentLoaded", () => {
         saveSettings({
             buyback_threshold_pct: parseFloat(document.getElementById("buybackThreshold").value) || 15,
             weekly_premium_goal: parseFloat(document.getElementById("weeklyGoal").value) || 0,
+            monthly_premium_goal: parseFloat(document.getElementById("monthlyGoal").value) || 0,
         }, "Preferences saved");
     });
     document.getElementById("importNowBtn").addEventListener("click", startImport);

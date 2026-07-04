@@ -686,21 +686,28 @@ def rebuild_and_store_tranches():
     return tranches, events
 
 
+def _current_prices():
+    """Best-effort last price per symbol: live IBKR snapshot if connected,
+    else the most recent cached price. Shared by /api/tranches and
+    /api/income so both compute unrealized P/L the same way."""
+    prices = {}
+    if state.ibkr is not None and state.ibkr.is_connected():
+        try:
+            snapshot = state.ibkr.get_snapshot(
+                [s for s in state.db.get_watchlist() if not is_cusip(s)])
+            prices = {s: d.get('last', 0) for s, d in snapshot['market_data'].items()}
+        except Exception:
+            pass
+    if not prices:
+        prices = {s: (d.get('last') or 0) for s, d in state.db.latest_prices().items()}
+    return prices
+
+
 @app.route('/api/tranches')
 def api_tranches():
     try:
         tranches, _ = rebuild_and_store_tranches()
-
-        prices = {}
-        if state.ibkr is not None and state.ibkr.is_connected():
-            try:
-                snapshot = state.ibkr.get_snapshot(
-                    [s for s in state.db.get_watchlist() if not is_cusip(s)])
-                prices = {s: d.get('last', 0) for s, d in snapshot['market_data'].items()}
-            except Exception:
-                pass
-        if not prices:
-            prices = {s: (d.get('last') or 0) for s, d in state.db.latest_prices().items()}
+        prices = _current_prices()
 
         by_symbol = {}
         for t in tranches:
@@ -715,6 +722,23 @@ def api_tranches():
                 qty = t['qty'] or 1
                 row['net_basis'] = round((t['open_price'] or 0) - (t['premium'] / qty), 4)
                 row['sell_would_uncover'] = t.get('covering_call') is not None
+
+                # Holding period, for the long/short-term capital-gains badge.
+                # SEEDED tranches predate the imported trade history, so their
+                # true acquisition date is unknown -- never guess at it.
+                if t.get('inferred') or not t.get('opened_ts'):
+                    row['days_held'] = None
+                    row['term'] = 'unknown'
+                else:
+                    try:
+                        opened = datetime.fromisoformat(t['opened_ts'])
+                        days_held = (datetime.now() - opened).days
+                        row['days_held'] = days_held
+                        row['term'] = 'long' if days_held > 365 else 'short'
+                    except ValueError:
+                        row['days_held'] = None
+                        row['term'] = 'unknown'
+                row['lifo_next'] = False
             by_symbol.setdefault(symbol, []).append(row)
 
         groups = []
@@ -722,6 +746,16 @@ def api_tranches():
             rows = by_symbol[symbol]
             open_rows = [r for r in rows if r['status'] == 'OPEN']
             closed_rows = [r for r in rows if r['status'] == 'CLOSED']
+
+            # Advisory only -- flags the most-recently-opened lot with a
+            # known acquisition date as the one to sell first for LIFO tax
+            # treatment. The tranche engine itself stays FIFO; this never
+            # changes which lot actually closes when a real sell happens,
+            # it's purely a signal for Dad to choose which lot to sell.
+            dated_open = [r for r in open_rows if r.get('opened_ts')]
+            if dated_open:
+                max(dated_open, key=lambda r: r['opened_ts'])['lifo_next'] = True
+
             groups.append({
                 'symbol': symbol,
                 'open': open_rows,
@@ -749,11 +783,29 @@ def api_income():
         tranches = state.db.get_tranches()
         events = state.db.get_events()
         closed = [t for t in tranches if t['status'] == 'CLOSED']
-        summary = income_summary(events, closed)
-        summary['weekly_goal'] = safe_number(state.db.get_setting('weekly_premium_goal', 0))
+        open_tranches = [t for t in tranches if t['status'] == 'OPEN']
+        weekly_goal = safe_number(state.db.get_setting('weekly_premium_goal', 0))
+        monthly_goal = safe_number(state.db.get_setting('monthly_premium_goal', 0))
+        summary = income_summary(events, closed, weekly_goal, monthly_goal)
+        summary['weekly_goal'] = weekly_goal
+        summary['monthly_goal'] = monthly_goal
         summary['trade_count'] = state.db.trade_count()
         summary['flex_configured'] = bool(state.db.get_setting('flex_token')
                                           and state.db.get_setting('flex_query_id'))
+
+        # Unrealized P/L on still-open tranches, so Income shows the full
+        # realized + unrealized picture rather than just what's closed.
+        prices = _current_prices()
+        unrealized = 0.0
+        has_price = False
+        for t in open_tranches:
+            current = safe_number(prices.get(t['symbol'], 0))
+            if not current:
+                continue
+            has_price = True
+            unrealized += (current - (t['open_price'] or 0)) * t['qty'] + t['premium']
+        summary['unrealized_pl_open'] = round(unrealized, 2) if has_price else None
+
         return jsonify(summary)
     except Exception as e:
         logger.error(f'Error in /api/income: {e}', exc_info=True)
@@ -769,6 +821,7 @@ def api_get_settings():
         'flex_token_set': bool(token),
         'buyback_threshold_pct': buyback_threshold_pct(),
         'weekly_premium_goal': safe_number(state.db.get_setting('weekly_premium_goal', 0)),
+        'monthly_premium_goal': safe_number(state.db.get_setting('monthly_premium_goal', 0)),
         'data_dir': os.path.dirname(state.db.path),
         'trade_count': state.db.trade_count(),
         'last_import': state.db.last_flex_import(),
@@ -789,6 +842,9 @@ def api_post_settings():
     if 'weekly_premium_goal' in payload:
         state.db.set_setting('weekly_premium_goal',
                              safe_number(payload['weekly_premium_goal']))
+    if 'monthly_premium_goal' in payload:
+        state.db.set_setting('monthly_premium_goal',
+                             safe_number(payload['monthly_premium_goal']))
     return jsonify({'success': True})
 
 

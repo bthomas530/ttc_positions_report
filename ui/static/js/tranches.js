@@ -52,11 +52,20 @@ function renderTranches(data) {
     container.innerHTML = "";
     data.groups.forEach(group => {
         if (group.open.length === 0 && group.closed.length === 0) return;
-        const el = document.createElement("div");
-        el.className = "tranche-group";
+        const sectionId = "tranche-" + group.symbol;
+        // Reuses .section/.section-header/.section-content so expand/collapse
+        // (and its persistence in the collapsedSections prefs array) works
+        // exactly like the Positions tab, via the existing toggleSection().
+        const el = document.createElement("section");
+        el.className = "section";
+        el.id = sectionId + "-section";
+        el.dataset.symbol = group.symbol;
 
         const openRows = group.open.map(t => {
             const badges = [];
+            if (t.lifo_next) badges.push('<span class="badge lifo" title="The most recently opened lot still held for this symbol — sell this one first for LIFO">SELL LIFO NEXT</span>');
+            if (t.term === "long") badges.push('<span class="badge term-long" title="Held over 1 year — eligible for long-term capital gains rates">LONG-TERM</span>');
+            else if (t.term === "short") badges.push('<span class="badge term-short" title="Held under 1 year — taxed at short-term/ordinary rates">SHORT-TERM</span>');
             if (t.inferred) badges.push('<span class="badge seeded" title="Opened before the imported history; entry price is IBKR’s average cost">SEEDED</span>');
             if (t.open_source === "PUT_ASSIGNMENT") badges.push('<span class="badge assignment">PUT ASSIGNED</span>');
             let coverCell = '—';
@@ -95,14 +104,18 @@ function renderTranches(data) {
         }).join("");
 
         let html =
-            '<div class="tranche-group-header">' +
-                '<h3>' + escapeHtml(group.symbol) + '</h3>' +
-                '<div class="tranche-group-stats">' +
-                    '<span>Open: <b>' + group.open_shares + ' sh</b></span>' +
-                    '<span>Premium: <b>' + fmtMoney(group.total_premium, true) + '</b></span>' +
-                    '<span>Realized: <b>' + fmtMoney(group.realized_pl, true) + '</b></span>' +
+            '<div class="section-header" onclick="toggleSection(\'' + sectionId + '\')">' +
+                '<h2>' + escapeHtml(group.symbol) + '</h2>' +
+                '<div class="section-controls">' +
+                    '<div class="tranche-group-stats">' +
+                        '<span>Open: <b>' + group.open_shares + ' sh</b></span>' +
+                        '<span>Premium: <b>' + fmtMoney(group.total_premium, true) + '</b></span>' +
+                        '<span>Realized: <b>' + fmtMoney(group.realized_pl, true) + '</b></span>' +
+                    '</div>' +
+                    '<i class="fas fa-chevron-down section-toggle"></i>' +
                 '</div>' +
-            '</div>';
+            '</div>' +
+            '<div class="section-content">';
 
         if (group.open.length > 0) {
             html += '<div class="table-container"><table class="tranche-table">' +
@@ -119,6 +132,7 @@ function renderTranches(data) {
                 '<th>Closed</th><th>Close Price</th><th>How</th><th>Realized P/L</th></tr></thead>' +
                 '<tbody>' + closedRows + '</tbody></table></div>';
         }
+        html += '</div>'; // .section-content
 
         el.innerHTML = html;
         const toggle = el.querySelector(".tranche-closed-toggle");
@@ -142,9 +156,58 @@ function renderTranches(data) {
         (data.last_import && data.last_import.requested_ts
             ? ' — last import ' + fmtDate(data.last_import.requested_ts) : '') + '.';
     container.appendChild(note);
+
+    // Restore collapsed state from the same prefs array Positions sections
+    // use -- toggleSection() already persists to it, nothing new to store.
+    const collapsed = (loadPreferences().collapsedSections || []);
+    collapsed.forEach(section => {
+        if (section.startsWith("tranche-")) {
+            const el = document.getElementById(section + "-section");
+            if (el) el.classList.add("collapsed");
+        }
+    });
+
+    // Re-apply an in-progress search after a reload/refresh rebuild
+    const searchInput = document.getElementById("trancheSearchInput");
+    if (searchInput && searchInput.value) filterTranches(searchInput.value);
+}
+
+function filterTranches(searchText) {
+    const groups = document.querySelectorAll("#tranches-content .section[data-symbol]");
+    let anyVisible = false;
+    groups.forEach(el => {
+        const match = !searchText || (el.dataset.symbol || "").match(new RegExp(searchText, "i"));
+        el.classList.toggle("hidden-by-filter", !match);
+        if (match) anyVisible = true;
+    });
+
+    let noResults = document.getElementById("tranches-no-results");
+    if (groups.length > 0 && !anyVisible) {
+        if (!noResults) {
+            noResults = document.createElement("div");
+            noResults.id = "tranches-no-results";
+            noResults.className = "no-results";
+            noResults.textContent = "No matching symbols found";
+            document.getElementById("tranches-content").appendChild(noResults);
+        }
+        noResults.style.display = "block";
+    } else if (noResults) {
+        noResults.style.display = "none";
+    }
+}
+
+function clearTrancheSearch() {
+    const input = document.getElementById("trancheSearchInput");
+    input.value = "";
+    filterTranches("");
+    input.focus();
 }
 
 document.addEventListener("DOMContentLoaded", () => {
     const btn = document.getElementById("tranchesRefreshBtn");
     if (btn) btn.addEventListener("click", loadTranches);
+    const searchInput = document.getElementById("trancheSearchInput");
+    if (searchInput) searchInput.addEventListener("input", (e) => filterTranches(e.target.value));
+    const clearBtn = document.getElementById("clearTrancheSearch");
+    if (clearBtn) clearBtn.addEventListener("click", clearTrancheSearch);
 });

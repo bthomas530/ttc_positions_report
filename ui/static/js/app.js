@@ -2,7 +2,10 @@
 // TTC Positions Report - Frontend JavaScript (core + Positions tab)
 
 let isRefreshing = false;
-let currentSort = { column: null, direction: "asc" };
+// Sort state is per-section (positions/incomplete/watchlist each sort
+// independently) and keyed by column key, not raw index, since hide/reorder
+// changes which index a column renders at between refreshes.
+let currentSort = { positions: null, incomplete: null, watchlist: null };
 let refreshInterval;
 let cachedData = null;
 let optionsBySymbol = {};
@@ -16,6 +19,115 @@ const DEFAULT_NOTIFICATION_PREFS = {
     position: "bottom-right",
     categories: { refresh: false, dataSource: true, actions: true, errors: true },
 };
+
+// Single source of truth for columns across the three Positions-tab tables,
+// the CSV exporter, and column customization prefs. `rowIndex` maps a column
+// key to its position in the flat per-row array the backend sends for that
+// section (see ttc_app/web.py enhance_with_market_data()); a key only lists
+// the sections it actually appears in.
+const DEFAULT_COLUMN_WIDTH = 120;
+// Per-column defaults so headers like "Daily Change %" don't truncate at a
+// flat width; Underlying gets extra room per the "a little wider" ask.
+const DEFAULT_COLUMN_WIDTHS = {
+    underlying: 190, shares: 90, current_price: 140, avg_price: 110,
+    daily_change_dollar: 140, daily_change_pct: 130, last_price: 110,
+    open: 100, ogap: 100, np: 70, cc: 70, uc: 70, shares_available: 140,
+    data_source: 130,
+};
+function defaultWidthFor(key) {
+    return DEFAULT_COLUMN_WIDTHS[key] || DEFAULT_COLUMN_WIDTH;
+}
+
+const COLUMN_DEFS = [
+    { key: "underlying", label: "Underlying", pinned: true,
+      rowIndex: { positions: 0, incomplete: 0, watchlist: 0 } },
+    { key: "shares", label: "Shares",
+      rowIndex: { positions: 1, incomplete: 1 } },
+    { key: "current_price", label: "Current Price",
+      rowIndex: { positions: 2, incomplete: 2, watchlist: 1 } },
+    { key: "avg_price", label: "Avg Price",
+      rowIndex: { positions: 3, incomplete: 3 } },
+    { key: "daily_change_dollar", label: "Daily Change $",
+      rowIndex: { positions: 4, incomplete: 4, watchlist: 2 } },
+    { key: "daily_change_pct", label: "Daily Change %",
+      rowIndex: { positions: 5, incomplete: 5, watchlist: 3 } },
+    { key: "last_price", label: "Last Price",
+      rowIndex: { positions: 6, incomplete: 6, watchlist: 4 } },
+    { key: "open", label: "Open",
+      rowIndex: { positions: 7, incomplete: 7, watchlist: 5 } },
+    { key: "ogap", label: "OGap",
+      rowIndex: { positions: 8, incomplete: 8, watchlist: 6 } },
+    { key: "np", label: "NP",
+      rowIndex: { positions: 9 } },
+    { key: "cc", label: "CC",
+      rowIndex: { positions: 10 } },
+    { key: "uc", label: "UC",
+      rowIndex: { positions: 11 } },
+    { key: "shares_available", label: "Shares Available",
+      rowIndex: { positions: 12 } },
+    // No natural row index -- rendered from getSourceInfo() instead.
+    { key: "data_source", label: "Data Source", rowIndex: {} },
+];
+const COLUMN_DEFS_BY_KEY = Object.fromEntries(COLUMN_DEFS.map(c => [c.key, c]));
+
+function columnKeysForSection(section) {
+    return COLUMN_DEFS
+        .filter(c => c.key === "data_source" || section in c.rowIndex)
+        .map(c => c.key);
+}
+
+function rowValue(row, key, section) {
+    const def = COLUMN_DEFS_BY_KEY[key];
+    if (!def || !(section in def.rowIndex)) return undefined;
+    return row[def.rowIndex[section]];
+}
+
+const DEFAULT_COLUMN_CONFIG = {
+    positions: { hidden: ["data_source"] },
+    incomplete: { hidden: ["data_source"] },
+    watchlist: { hidden: ["data_source"] },
+};
+
+// Column config (order/hidden/widths per section) follows the same
+// merge-over-defaults pattern as getNotificationPrefs(), stored in the same
+// PREFS_KEY blob. `order` always lists every applicable non-underlying key
+// (visible or not) so the Columns modal has something to render a row for;
+// `hidden` marks which of those are currently off.
+function getColumnConfig(section) {
+    const applicable = columnKeysForSection(section);
+    const applicableSet = new Set(applicable);
+    const saved = (loadPreferences().columns || {})[section] || {};
+    const defaults = DEFAULT_COLUMN_CONFIG[section];
+
+    let order = (saved.order || []).filter(k => applicableSet.has(k) && k !== "underlying");
+    applicable.forEach(k => { if (k !== "underlying" && !order.includes(k)) order.push(k); });
+
+    const hidden = (saved.hidden !== undefined ? saved.hidden : defaults.hidden)
+        .filter(k => applicableSet.has(k));
+    const widths = { ...(saved.widths || {}) };
+
+    return { order, hidden, widths };
+}
+
+function saveColumnConfig(section, partial) {
+    const current = getColumnConfig(section);
+    const merged = { ...current, ...partial };
+    const allColumns = loadPreferences().columns || {};
+    savePreferences({ columns: { ...allColumns, [section]: merged } });
+}
+
+function resetColumnConfig(section) {
+    const allColumns = loadPreferences().columns || {};
+    delete allColumns[section];
+    savePreferences({ columns: allColumns });
+}
+
+function visibleColumnsForSection(section, config) {
+    config = config || getColumnConfig(section);
+    const hiddenSet = new Set(config.hidden);
+    const orderedKeys = ["underlying", ...config.order.filter(k => !hiddenSet.has(k))];
+    return orderedKeys.map(k => COLUMN_DEFS_BY_KEY[k]).filter(Boolean);
+}
 
 // Debug logging
 function log(msg) {
@@ -190,6 +302,104 @@ function closeDiagnosticsModal() {
     document.getElementById("diagnostics-modal").classList.remove("active");
 }
 
+let columnsModalSection = null;
+
+function openColumnsModal(section) {
+    columnsModalSection = section;
+    renderColumnsModalBody(section);
+    document.getElementById("columns-modal").classList.add("active");
+}
+
+function closeColumnsModal() {
+    document.getElementById("columns-modal").classList.remove("active");
+    columnsModalSection = null;
+    // Reflect any hide/show/reorder/width changes immediately rather than
+    // waiting for the next auto-refresh tick.
+    if (cachedData) updateTables();
+}
+
+function renderColumnsModalBody(section) {
+    const config = getColumnConfig(section);
+    const rows = ["underlying", ...config.order];
+
+    const body = document.getElementById("columns-body");
+    body.innerHTML = "";
+    rows.forEach((key, idx) => {
+        const def = COLUMN_DEFS_BY_KEY[key];
+        if (!def) return;
+        const pinned = key === "underlying";
+        const rowEl = document.createElement("div");
+        rowEl.className = "columns-row" + (pinned ? " pinned" : "");
+
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.checked = !config.hidden.includes(key);
+        checkbox.disabled = pinned;
+        checkbox.addEventListener("change", () => {
+            const hidden = config.hidden.filter(k => k !== key);
+            if (!checkbox.checked) hidden.push(key);
+            saveColumnConfig(section, { hidden });
+            renderColumnsModalBody(section);
+        });
+
+        const name = document.createElement("span");
+        name.className = "col-name";
+        name.textContent = def.label + (pinned ? " (always shown)" : "");
+
+        const width = document.createElement("input");
+        width.type = "number";
+        width.className = "col-width";
+        width.min = 50;
+        width.step = 10;
+        width.title = "Width (px)";
+        width.value = config.widths[key] || defaultWidthFor(key);
+        width.addEventListener("change", () => {
+            const val = Math.max(50, parseInt(width.value) || defaultWidthFor(key));
+            const current = getColumnConfig(section);
+            saveColumnConfig(section, { widths: { ...current.widths, [key]: val } });
+        });
+
+        rowEl.appendChild(checkbox);
+        rowEl.appendChild(name);
+        if (!pinned) {
+            const reorder = document.createElement("div");
+            reorder.className = "col-reorder";
+            const upBtn = document.createElement("button");
+            upBtn.type = "button";
+            upBtn.innerHTML = '<i class="fas fa-arrow-up"></i>';
+            upBtn.disabled = idx <= 1;
+            upBtn.addEventListener("click", () => moveColumn(section, key, -1));
+            const downBtn = document.createElement("button");
+            downBtn.type = "button";
+            downBtn.innerHTML = '<i class="fas fa-arrow-down"></i>';
+            downBtn.disabled = idx === rows.length - 1;
+            downBtn.addEventListener("click", () => moveColumn(section, key, 1));
+            reorder.appendChild(upBtn);
+            reorder.appendChild(downBtn);
+            rowEl.appendChild(reorder);
+        }
+        rowEl.appendChild(width);
+        body.appendChild(rowEl);
+    });
+}
+
+function moveColumn(section, key, delta) {
+    const config = getColumnConfig(section);
+    const order = config.order.slice();
+    const idx = order.indexOf(key);
+    const newIdx = idx + delta;
+    if (idx === -1 || newIdx < 0 || newIdx >= order.length) return;
+    [order[idx], order[newIdx]] = [order[newIdx], order[idx]];
+    saveColumnConfig(section, { order });
+    renderColumnsModalBody(section);
+}
+
+function resetColumnsToDefault() {
+    if (!columnsModalSection) return;
+    resetColumnConfig(columnsModalSection);
+    renderColumnsModalBody(columnsModalSection);
+}
+
 function escapeHtml(s) {
     if (s === null || s === undefined) return "";
     return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"})[c]);
@@ -269,9 +479,18 @@ function exportToCSV() {
         showToast("No data to export", "error", 3000, "errors");
         return;
     }
-    let csv = ["Symbol","Shares","Current Price","Avg Price","Daily Change $","Daily Change %","Last Price","Open","OGap","NP","CC","UC","Shares Available","Data Source"].join(",") + "\n";
+    // Exports whatever columns are currently visible/ordered on the
+    // Positions table, so hiding/reordering columns there also reshapes CSVs.
+    const cols = visibleColumnsForSection("positions");
+    let csv = cols.map(c => c.label).join(",") + "\n";
     cachedData.positions.forEach(row => {
-        csv += row.slice(0, 14).map((val, i) => i === 5 ? (val * 100).toFixed(2) + "%" : (typeof val === "number" ? val.toFixed(2) : val)).join(",") + "\n";
+        const { source } = getSourceInfo(row, "positions");
+        csv += cols.map(c => {
+            if (c.key === "data_source") return SOURCE_LABELS[source] || source;
+            const val = row[c.rowIndex.positions];
+            if (c.key === "daily_change_pct" && typeof val === "number") return (val * 100).toFixed(2) + "%";
+            return typeof val === "number" ? val.toFixed(2) : val;
+        }).join(",") + "\n";
     });
     const blob = new Blob([csv], { type: "text/csv" });
     const a = document.createElement("a");
@@ -353,84 +572,101 @@ function createSourceDot(source, dataAge) {
     return dot;
 }
 
-function createTable(data, headers, section) {
+function createTable(data, section) {
+    const config = getColumnConfig(section);
+    const visibleCols = visibleColumnsForSection(section, config);
+
     const table = document.createElement("table");
+    table.classList.add("data-table");
+    table.dataset.section = section;
+
+    const colgroup = document.createElement("colgroup");
+    visibleCols.forEach(colDef => {
+        const col = document.createElement("col");
+        const width = config.widths[colDef.key] || defaultWidthFor(colDef.key);
+        col.style.width = width + "px";
+        colgroup.appendChild(col);
+    });
+    table.appendChild(colgroup);
+
     const thead = document.createElement("thead");
     const headerRow = document.createElement("tr");
-    
-    // Display headers exclude source metadata columns
-    let sectionHeaders = headers;
-    if (section === "incomplete") {
-        sectionHeaders = headers.filter(h => !["NP", "CC", "UC", "Shares Available"].includes(h));
-    } else if (section === "watchlist") {
-        sectionHeaders = ["Underlying", "Current Price", "Daily Change $", "Daily Change %", "Last Price", "Open", "OGap"];
-    }
-    
-    sectionHeaders.forEach((header, idx) => {
+    visibleCols.forEach(colDef => {
         const th = document.createElement("th");
-        th.textContent = header;
+        th.appendChild(document.createTextNode(colDef.label));
+        th.dataset.colKey = colDef.key;
         th.classList.add("sortable");
-        th.addEventListener("click", () => sortTable(table, idx, header));
+        th.addEventListener("click", (e) => {
+            if (e.target.closest(".th-resize-handle")) return;
+            sortTable(table, section, th.cellIndex, colDef.key);
+        });
+        const handle = document.createElement("span");
+        handle.className = "th-resize-handle";
+        handle.title = "Drag to resize";
+        handle.addEventListener("mousedown", (e) => startColumnResize(e, section, colDef.key, table));
+        handle.addEventListener("click", (e) => e.stopPropagation());
+        th.appendChild(handle);
         headerRow.appendChild(th);
     });
     thead.appendChild(headerRow);
     table.appendChild(thead);
-    
+
     const tbody = document.createElement("tbody");
     data.sort((a, b) => a[0].toString().toLowerCase().localeCompare(b[0].toString().toLowerCase()));
-    
+
     data.forEach(row => {
         const tr = document.createElement("tr");
         const { source, dataAge } = getSourceInfo(row, section);
-        
-        let rowData = [...row];
-        if (section === "incomplete") {
-            rowData = rowData.filter((_, i) => !["NP", "CC", "UC", "Shares Available"].includes(headers[i]));
-        } else if (section === "watchlist") {
-            rowData = rowData.slice(0, 7);
-        }
-        
-        rowData.forEach((cell, idx) => {
+
+        visibleCols.forEach(colDef => {
             const td = document.createElement("td");
-            const header = sectionHeaders[idx];
-            
-            if (header === "Underlying") {
+            const header = colDef.label;
+
+            if (colDef.key === "data_source") {
+                td.textContent = SOURCE_LABELS[source] || source;
+                tr.appendChild(td);
+                return;
+            }
+
+            const cell = row[colDef.rowIndex[section]];
+
+            if (colDef.key === "underlying") {
                 td.appendChild(createSymbolLink(cell));
             } else if (typeof cell === "number") {
-                if (header === "Current Price") {
+                if (colDef.key === "current_price") {
                     // Add source indicator dot for Current Price column
                     const wrapper = document.createElement("span");
                     wrapper.className = "price-cell";
                     if (source === "cached") wrapper.classList.add("price-stale");
-                    
+
                     const priceText = document.createElement("span");
                     priceText.textContent = formatNumber(cell, header);
                     wrapper.appendChild(priceText);
-                    
+
                     // Only show dot when source is not IBKR (non-live data)
                     if (source !== "ibkr") {
                         wrapper.appendChild(createSourceDot(source, dataAge));
                     }
-                    
+
                     td.appendChild(wrapper);
-                    
-                    const changeIdx = headers.indexOf("Daily Change $");
-                    if (row[changeIdx] > 0) td.classList.add("positive");
-                    if (row[changeIdx] < 0) td.classList.add("negative");
+
+                    const change = rowValue(row, "daily_change_dollar", section);
+                    if (change > 0) td.classList.add("positive");
+                    if (change < 0) td.classList.add("negative");
                 } else {
                     td.textContent = formatNumber(cell, header);
-                    if (["Daily Change $", "Daily Change %", "OGap"].includes(header)) {
+                    if (["daily_change_dollar", "daily_change_pct", "ogap"].includes(colDef.key)) {
                         if (cell > 0) td.classList.add("positive");
                         if (cell < 0) td.classList.add("negative");
-                    } else if (header === "Shares" && cell === 0) {
+                    } else if (colDef.key === "shares" && cell === 0) {
                         td.classList.add("zero-shares");
-                    } else if (header === "NP" && cell > 0) {
+                    } else if (colDef.key === "np" && cell > 0) {
                         td.classList.add("naked-puts");
-                    } else if (header === "CC" && cell > 0) {
+                    } else if (colDef.key === "cc" && cell > 0) {
                         td.classList.add("covered-calls");
-                    } else if (header === "UC" && cell > 0) {
+                    } else if (colDef.key === "uc" && cell > 0) {
                         td.classList.add("uncovered-calls");
-                    } else if (header === "Shares Available") {
+                    } else if (colDef.key === "shares_available") {
                         if (cell > 0) td.classList.add("shares-available");
                         if (cell < 0) td.classList.add("shares-negative");
                     }
@@ -454,12 +690,24 @@ function createTable(data, headers, section) {
                 badge.className = "opt-count-badge";
                 badge.textContent = opts.length;
                 badge.title = opts.length + " option contract(s) — click to expand";
+                firstTd.appendChild(badge);
+
+                // Surface a buyback opportunity without needing to expand the
+                // row first -- previously only visible inside the option
+                // sub-table.
+                if (opts.some(o => o.buyback_target_hit)) {
+                    const buybackBadge = document.createElement("span");
+                    buybackBadge.className = "buyback-badge collapsed-hint";
+                    buybackBadge.textContent = "BUYBACK";
+                    buybackBadge.title = "At least one option here has hit its buyback threshold";
+                    firstTd.appendChild(buybackBadge);
+                }
+
                 const expander = document.createElement("i");
                 expander.className = "fas fa-chevron-right opt-expander";
-                firstTd.appendChild(badge);
                 firstTd.appendChild(expander);
 
-                const detail = buildOptionDetailRow(symbol, opts, sectionHeaders.length);
+                const detail = buildOptionDetailRow(symbol, opts, visibleCols.length);
                 detail.style.display = "none";
                 tbody.appendChild(detail);
 
@@ -474,7 +722,37 @@ function createTable(data, headers, section) {
         }
     });
     table.appendChild(tbody);
+    applySort(table, section);
     return table;
+}
+
+function startColumnResize(e, section, key, table) {
+    e.preventDefault();
+    e.stopPropagation();
+    const handle = e.currentTarget;
+    const th = handle.closest("th");
+    const colIndex = th.cellIndex;
+    const col = table.querySelector("colgroup").children[colIndex];
+    const startX = e.clientX;
+    const startWidth = col.getBoundingClientRect().width;
+    handle.classList.add("active");
+    th.classList.add("resizing");
+
+    function onMove(ev) {
+        const newWidth = Math.max(50, Math.round(startWidth + (ev.clientX - startX)));
+        col.style.width = newWidth + "px";
+    }
+    function onUp() {
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", onUp);
+        handle.classList.remove("active");
+        th.classList.remove("resizing");
+        const finalWidth = Math.max(50, Math.round(col.getBoundingClientRect().width));
+        const current = getColumnConfig(section);
+        saveColumnConfig(section, { widths: { ...current.widths, [key]: finalWidth } });
+    }
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
 }
 
 function buildOptionDetailRow(symbol, opts, colspan) {
@@ -515,24 +793,42 @@ function buildOptionDetailRow(symbol, opts, colspan) {
     return tr;
 }
 
-function sortTable(table, colIndex) {
+function sortTable(table, section, colIndex, key) {
+    const current = currentSort[section];
+    let dir = "asc";
+    if (current && current.key === key) {
+        dir = current.direction === "asc" ? "desc" : "asc";
+    }
+    currentSort[section] = { key, direction: dir };
+    doSort(table, colIndex, key, dir);
+}
+
+// Re-applies whatever sort is already active for this section -- called after
+// every createTable() rebuild (including periodic auto-refresh) so a chosen
+// sort order survives instead of silently reverting to alphabetical.
+function applySort(table, section) {
+    const sort = currentSort[section];
+    if (!sort) return;
+    const th = Array.from(table.querySelectorAll("th")).find(t => t.dataset.colKey === sort.key);
+    if (!th) return; // column got hidden since the sort was chosen
+    doSort(table, th.cellIndex, sort.key, sort.direction);
+}
+
+function doSort(table, colIndex, key, dir) {
     const tbody = table.querySelector("tbody");
-    // Option-detail rows travel with their parent row, never sort on their own
-    const rows = Array.from(tbody.querySelectorAll("tr:not(.option-detail)"));
+    // Direct children only -- querySelectorAll("tr:not(.option-detail)") would
+    // also match rows *inside* the nested option-subtable (a plain <tr> with
+    // no class), tearing them out of their own table and into this one.
+    const topLevelRows = Array.from(tbody.children);
+    const rows = topLevelRows.filter(tr => !tr.classList.contains("option-detail"));
     const details = {};
-    tbody.querySelectorAll("tr.option-detail").forEach(d => {
+    topLevelRows.filter(tr => tr.classList.contains("option-detail")).forEach(d => {
         details[d.dataset.parent] = d;
     });
-    const th = table.querySelector("th:nth-child(" + (colIndex + 1) + ")");
 
     table.querySelectorAll("th").forEach(h => h.classList.remove("asc", "desc"));
-
-    let dir = "asc";
-    if (currentSort.column === colIndex) {
-        dir = currentSort.direction === "asc" ? "desc" : "asc";
-    }
-    currentSort = { column: colIndex, direction: dir };
-    th.classList.add(dir);
+    const th = table.querySelector('th[data-col-key="' + key + '"]');
+    if (th) th.classList.add(dir);
 
     rows.sort((a, b) => {
         const aVal = getCellValue(a, colIndex);
@@ -557,7 +853,12 @@ function getCellValue(row, index) {
 
 function filterTables(searchText) {
     document.querySelectorAll("#tab-positions table:not(.option-subtable)").forEach(table => {
-        const rows = table.querySelectorAll("tbody tr:not(.option-detail)");
+        const tbody = table.querySelector("tbody");
+        if (!tbody) return;
+        // Direct children only -- querySelectorAll("tbody tr:not(.option-detail)")
+        // would also reach rows inside the nested option-subtable and filter
+        // those independently by symbol text, which is wrong.
+        const rows = Array.from(tbody.children).filter(tr => !tr.classList.contains("option-detail"));
         let hasVisible = false;
 
         rows.forEach(row => {
@@ -721,22 +1022,20 @@ async function updateTables() {
         
         log("Data received: " + data.positions.length + " positions, " + data.watchlist.length + " watchlist");
         cachedData = data;
-        
-        const headers = ["Underlying", "Shares", "Current Price", "Avg Price", "Daily Change $", "Daily Change %", "Last Price", "Open", "OGap", "NP", "CC", "UC", "Shares Available"];
-        
+
         const positionsTable = document.getElementById("positions-table");
         const incompleteTable = document.getElementById("incomplete-table");
         const watchlistTable = document.getElementById("watchlist-table");
-        
+
         optionsBySymbol = data.options_by_symbol || {};
 
         positionsTable.innerHTML = data.positions.length > 0 ? "" : '<div class="no-results">No positions found</div>';
         incompleteTable.innerHTML = data.incomplete_lots.length > 0 ? "" : '<div class="no-results">No incomplete lots</div>';
         watchlistTable.innerHTML = data.watchlist.length > 0 ? "" : '<div class="no-results">No watchlist items</div>';
-        
-        if (data.positions.length > 0) positionsTable.appendChild(createTable(data.positions, headers, "positions"));
-        if (data.incomplete_lots.length > 0) incompleteTable.appendChild(createTable(data.incomplete_lots, headers, "incomplete"));
-        if (data.watchlist.length > 0) watchlistTable.appendChild(createTable(data.watchlist, headers, "watchlist"));
+
+        if (data.positions.length > 0) positionsTable.appendChild(createTable(data.positions, "positions"));
+        if (data.incomplete_lots.length > 0) incompleteTable.appendChild(createTable(data.incomplete_lots, "incomplete"));
+        if (data.watchlist.length > 0) watchlistTable.appendChild(createTable(data.watchlist, "watchlist"));
         
         updateLastUpdateTime();
         updateSummaryStats(data);
@@ -777,7 +1076,11 @@ function setRefreshRate(seconds) {
 document.addEventListener("keydown", (e) => {
     if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") {
         if (e.key === "Escape") {
-            clearSearch();
+            if (e.target.id === "trancheSearchInput") {
+                clearTrancheSearch();
+            } else {
+                clearSearch();
+            }
             e.target.blur();
         }
         return;
@@ -884,6 +1187,10 @@ document.addEventListener("DOMContentLoaded", () => {
         if (e.target === document.getElementById("diagnostics-modal")) closeDiagnosticsModal();
     });
     document.getElementById("diagnosticsRefreshBtn").addEventListener("click", loadDiagnostics);
+    document.getElementById("columns-modal").addEventListener("click", (e) => {
+        if (e.target === document.getElementById("columns-modal")) closeColumnsModal();
+    });
+    document.getElementById("columnsResetBtn").addEventListener("click", resetColumnsToDefault);
 
     initTabs();
 
