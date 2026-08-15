@@ -267,14 +267,28 @@ def get_ibkr_data():
     basic_data = {
         'positions': [],
         'incomplete_lots': [],
-        'watchlist': [s for s in watchlist if s not in stock_positions and not is_cusip(s)],
+        'watchlist': [s for s in watchlist
+                      if s not in stock_positions and s not in option_positions
+                      and not is_cusip(s)],
         'market_data': market_data,
         'data_sources': data_sources,
         'connection_source': 'ibkr',
         'options': options,
     }
 
-    for symbol, stock_data in stock_positions.items():
+    # Symbols with options but no stock (cash-secured short puts, e.g.) must
+    # still get a Positions row -- iterating stock_positions alone silently
+    # dropped them into the watchlist with their options invisible.
+    position_symbols = list(stock_positions)
+    position_symbols += sorted(s for s in option_positions if s not in stock_positions)
+
+    for symbol in position_symbols:
+        stock_data = stock_positions.get(symbol, {
+            'symbol': symbol,
+            'shares': 0,
+            'avgCost': 0,
+            'marketPrice': market_data.get(symbol, {}).get('last', 0),
+        })
         stock_quantity = stock_data['shares']
         complete_lots = (abs(stock_quantity) // 100) * 100
         incomplete_lot = abs(stock_quantity) % 100
