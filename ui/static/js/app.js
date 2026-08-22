@@ -51,7 +51,7 @@ const COLUMN_DEFS = [
       rowIndex: { positions: 4, incomplete: 4, watchlist: 2 } },
     { key: "daily_change_pct", label: "Daily Change %",
       rowIndex: { positions: 5, incomplete: 5, watchlist: 3 } },
-    { key: "last_price", label: "Last Price",
+    { key: "last_price", label: "Prev Close",
       rowIndex: { positions: 6, incomplete: 6, watchlist: 4 } },
     { key: "open", label: "Open",
       rowIndex: { positions: 7, incomplete: 7, watchlist: 5 } },
@@ -128,6 +128,328 @@ function visibleColumnsForSection(section, config) {
     const orderedKeys = ["underlying", ...config.order.filter(k => !hiddenSet.has(k))];
     return orderedKeys.map(k => COLUMN_DEFS_BY_KEY[k]).filter(Boolean);
 }
+
+// ---------------------------------------------------------------------------
+// Column help
+// ---------------------------------------------------------------------------
+// One registry for every table header in the app -- Positions, the option
+// sub-table, Tranches, Income -- so a column's explanation lives in exactly
+// one place no matter which file renders the header. Positions columns reuse
+// their COLUMN_DEFS key verbatim; every other table namespaces its keys
+// ("opt.", "tranche.", "income.") because the same word means different
+// things in different tabs (Tranches "Premium" is per-lot, Income "Premium"
+// is per-period).
+//
+// Each entry: { what } is plain English, { calc } is the actual arithmetic,
+// { note } is anything else worth knowing. `calc` may be a function when the
+// text depends on live data (e.g. the configured buyback threshold).
+const COLUMN_HELP = {
+    // ---- Positions / Incomplete Lots / Watchlist ----
+    underlying: {
+        what: "The stock this row is about. Click the ticker to open it on TradingView.",
+        note: "A number badge means this symbol has open option contracts — click the row to expand them.",
+    },
+    shares: {
+        what: "Shares of the stock currently held. Negative means a short stock position.",
+        calc: "IBKR's position quantity, as-is. 0 shares with an option badge means options only — a cash-secured put with no stock behind it yet.",
+    },
+    current_price: {
+        what: "What the stock is trading at right now.",
+        calc: "IBKR's market price (midpoint of bid/ask during the session, last trade otherwise). If IBKR can't price it: Yahoo → Cboe delayed → last price saved in the database.",
+        note: "A colored dot next to the price means it did NOT come from IBKR — hover the dot for the source and its age.",
+    },
+    avg_price: {
+        what: "Average cost per share for the whole stock position.",
+        calc: "IBKR's average cost, including commissions. This is IBKR's blended number across every lot — the Tranches tab breaks the same shares into individual lots and applies option premium to each.",
+    },
+    daily_change_dollar: {
+        what: "How far the stock has moved per share today.",
+        calc: "Current Price − Prev Close. Green above zero, red below.",
+    },
+    daily_change_pct: {
+        what: "Today's move as a percentage of yesterday's close.",
+        calc: "(Current Price − Prev Close) ÷ Prev Close.",
+    },
+    last_price: {
+        what: "The previous session's closing price — yesterday's close, not the latest trade. Today's price is Current Price.",
+        calc: "IBKR's close for the symbol. Every daily-change number on this row is measured against it.",
+    },
+    open: {
+        what: "Where the stock opened this session.",
+        calc: "IBKR's open for the current session.",
+    },
+    ogap: {
+        what: "The overnight gap — how far the stock opened away from where it closed the day before.",
+        calc: "Open − Prev Close. Positive gapped up overnight, negative gapped down.",
+    },
+    np: {
+        what: "Put contracts written on this symbol — the cash-secured puts.",
+        calc: "Absolute value of the net put position (all put contract quantities for the symbol, summed). 1 contract = an obligation to buy 100 shares at the strike if assigned.",
+    },
+    cc: {
+        what: "Written calls that are covered by shares already held.",
+        calc: "The smaller of: whole 100-share lots held, or total call contracts. Only counted when the stock position is long.",
+    },
+    uc: {
+        what: "Written calls with no shares behind them — assignment would mean buying shares at market or going short.",
+        calc: "Total call contracts − whole 100-share lots held, floored at 0. With no long stock, every call counts as uncovered.",
+    },
+    shares_available: {
+        what: "Shares not already pledged against written calls — what could be sold without leaving a call uncovered.",
+        calc: "Shares − (CC × 100) − (UC × 100). A negative number means calls are written against more shares than are actually held.",
+    },
+    data_source: {
+        what: "Where this row's price came from on the last refresh.",
+        calc: "Fallback order: IBKR (live) → Yahoo Finance → Cboe (delayed) → Cached (the last price saved in the database, shown with its age).",
+    },
+
+    // ---- Option sub-table (expand a Positions row) ----
+    "opt.contract": {
+        what: "Whether this contract is a put or a call.",
+    },
+    "opt.pos": {
+        what: "How many contracts are held. Negative means sold/written — the normal case on the wheel.",
+        calc: "IBKR's position quantity for the contract. 1 contract = 100 shares.",
+    },
+    "opt.strike": {
+        what: "The contract's strike — the price shares change hands at if it's assigned.",
+    },
+    "opt.expiry": {
+        what: "The date the contract expires.",
+    },
+    "opt.dte": {
+        what: "Days to expiration.",
+        calc: "Calendar days from today to the expiration date. 0d expires today; a negative number means it's past expiry and hasn't cleared out of the account yet.",
+    },
+    "opt.delta": {
+        what: "Roughly how much the contract's price moves for a $1 move in the stock — and a rough stand-in for the odds of finishing in the money (0.30 ≈ 30%).",
+        calc: "IBKR's model greek. Blank when IBKR hasn't sent greeks for the contract yet.",
+    },
+    "opt.theta": {
+        what: "Time decay — about what the contract loses in value per day, all else equal. On a written option that decay is working for you.",
+        calc: "IBKR's model greek, per share. Multiply by 100 for one contract.",
+    },
+    "opt.iv": {
+        what: "Implied volatility — how much movement the option's price implies, annualized. Higher IV means richer premium.",
+        calc: "IBKR's model implied volatility, shown as a percentage.",
+    },
+    "opt.entry": {
+        what: "The price per share the contract was opened at — on a written option, the premium collected.",
+        calc: "IBKR's average cost for the position ÷ the multiplier (100). Multiply by 100 for dollars per contract.",
+    },
+    "opt.mark": {
+        what: "What the contract is worth right now, per share. On a written option that's roughly what it would cost to buy it back and close the trade.",
+        calc: "IBKR's market price for the contract — the midpoint of bid/ask during the session, falling back to the last trade, then the previous close. Multiply by 100 for dollars to close one contract.",
+        note: "Entry is what came in when it was sold; Mark is what it would cost to get out today. The gap between them is the profit so far.",
+    },
+    "opt.prem_left": {
+        what: "How much of the premium is still at risk on a written option. 20% left means 80% of the premium has already been earned.",
+        calc: () => "Mark ÷ Entry × 100. The row turns amber with a BUYBACK TARGET badge at or below "
+            + (cachedData && cachedData.buyback_threshold_pct ? cachedData.buyback_threshold_pct + "%" : "the threshold")
+            + ", set under Settings → Trading Preferences.",
+    },
+
+    // ---- Tranches tab: open lots ----
+    "tranche.opened": {
+        what: "The date this lot of shares was acquired, plus badges for how it opened and how long it's been held.",
+        calc: "Taken from the imported trade history — either a stock buy or a put assignment (PUT ASSIGNED).",
+        note: "SEEDED means the lot predates the imported trade history, so its real open date is unknown and no long/short-term badge is shown.",
+    },
+    "tranche.qty": {
+        what: "Shares in this lot.",
+        calc: "Lots are rebuilt FIFO from the trade history, which is the order IBKR actually closed them in. A lot is split only when a covered call needs exactly 100 shares.",
+    },
+    "tranche.open_price": {
+        what: "Price per share paid to open the lot.",
+        calc: "The trade price on a buy, or the put's strike on an assignment. Commissions are carried in Premium, not here.",
+    },
+    "tranche.premium": {
+        what: "Net option premium collected against these specific shares.",
+        calc: "The assigned put's premium carried into the lot, plus covered-call premium (one contract per 100 shares), minus anything paid to buy those options back. All net of commissions.",
+    },
+    "tranche.net_basis": {
+        what: "The effective cost per share once premium is applied — the real break-even on these shares.",
+        calc: "Open Price − (Premium ÷ Qty).",
+    },
+    "tranche.current": {
+        what: "The latest price per share for the symbol.",
+        calc: "Live IBKR price when connected, otherwise the most recent price saved in the database.",
+    },
+    "tranche.unrealized": {
+        what: "Where this lot stands right now, premium included.",
+        calc: "(Current − Open Price) × Qty + Premium. Blank when no current price is available.",
+    },
+    "tranche.covering_call": {
+        what: "The written call currently covering these shares, if there is one.",
+        calc: "Shows the covering call's strike and expiry. When it's there, selling these shares would leave that call uncovered — hence the warning.",
+    },
+
+    // ---- Tranches tab: closed lots ----
+    "tranche.closed": {
+        what: "The date the lot was closed out.",
+    },
+    "tranche.close_price": {
+        what: "Price per share the lot went out at.",
+        calc: "The sale price, or the call's strike when the shares were called away.",
+    },
+    "tranche.how": {
+        what: "How the lot closed — sold on the open market, or CALLED AWAY by an assigned covered call.",
+    },
+    "tranche.realized": {
+        what: "The final profit or loss on this lot, premium included.",
+        calc: "Cash received at close − cash paid at open + all premium attributed to the lot, every piece net of commissions.",
+    },
+
+    // ---- Income tab ----
+    "income.symbol": {
+        what: "The underlying the premium came from.",
+        calc: "Every put and call premium event for that symbol, summed across the whole imported history.",
+    },
+    "income.premium_symbol": {
+        what: "Net option premium collected on this symbol.",
+        calc: "Credits from selling puts and calls, minus what was paid to buy them back, net of commissions.",
+    },
+    "income.week": {
+        what: "An ISO week, labeled year-Wnn (weeks run Monday through Sunday).",
+    },
+    "income.month": {
+        what: "A calendar month, labeled year-mm.",
+    },
+    "income.premium_period": {
+        what: "Net option premium collected in this period.",
+        calc: "Credits from selling puts and calls, minus buybacks, net of commissions — bucketed by each trade's own date.",
+        note: "Assignments are not counted again here; that premium was already booked on the day the option was sold.",
+    },
+    "income.assign_date": {
+        what: "When the assignment happened.",
+    },
+    "income.assign_symbol": {
+        what: "The underlying whose shares moved.",
+    },
+    "income.assign_what": {
+        what: "Which direction the shares went: a written put was assigned and shares came in, or a written call was assigned and shares were called away.",
+    },
+    "income.assign_amount": {
+        what: "The cash tied to that assignment event.",
+        calc: "On a put assignment: the put premium carried into the new lot of shares. On a called-away lot: the proceeds from the shares going out, net of commissions.",
+    },
+    "income.card_week": {
+        what: "Net option premium collected so far in the current ISO week (Monday through Sunday).",
+        calc: "Same arithmetic as the Premium by week table — sales minus buybacks, net of commissions.",
+    },
+    "income.card_month": {
+        what: "Net option premium collected so far in the current calendar month.",
+        calc: "Same arithmetic as the Premium by month table — sales minus buybacks, net of commissions.",
+    },
+    "income.card_realized": {
+        what: "Profit and loss already banked from lots that are completely closed out.",
+        calc: "Sum of Realized P/L across every closed tranche, which already includes the premium attributed to those lots.",
+    },
+    "income.card_unrealized": {
+        what: "Where all the still-open lots stand right now, premium included.",
+        calc: "Summed over open tranches: (Current − Open Price) × Qty + Premium. Shows a dash when no current prices are available.",
+    },
+    "income.outcome_expired": {
+        what: "Written options that ran to expiration worthless — the wheel working exactly as intended.",
+        calc: "Count of expiry events, and the premium those contracts brought in.",
+    },
+    "income.outcome_bought_back": {
+        what: "Written options closed early by buying them back.",
+        calc: "Count of buyback trades, and their net cash effect (a cost, so normally negative).",
+    },
+    "income.outcome_assigned": {
+        what: "Written puts that were assigned, putting shares into the account.",
+        calc: "Count of put assignments, and the premium carried into the resulting lots.",
+    },
+};
+
+// A header label wrapped so it can carry a hover explanation. Used by the
+// string-built tables (option sub-table, Tranches, Income); createTable()
+// builds the equivalent node directly.
+function helpLabel(label, key) {
+    return '<span class="th-help" data-help="' + escapeHtml(key) + '">' + escapeHtml(label) + '</span>';
+}
+
+// <th> with a help-enabled label, for the string-built tables.
+function helpTh(label, key, extraAttrs) {
+    return '<th' + (extraAttrs ? ' ' + extraAttrs : '') + '>' + helpLabel(label, key) + '</th>';
+}
+
+let helpTipEl = null;
+
+// The tooltip lives on <body>, not inside the <th>. Every table here sits in
+// a .table-container with overflow-x:auto, which would clip a tooltip
+// rendered as a descendant of the cell.
+function ensureHelpTip() {
+    if (!helpTipEl) {
+        helpTipEl = document.createElement("div");
+        helpTipEl.id = "help-tooltip";
+        helpTipEl.setAttribute("role", "tooltip");
+        document.body.appendChild(helpTipEl);
+    }
+    return helpTipEl;
+}
+
+function showHelpTip(target) {
+    const entry = COLUMN_HELP[target.dataset.help];
+    if (!entry) return;
+    const tip = ensureHelpTip();
+    const calc = typeof entry.calc === "function" ? entry.calc() : entry.calc;
+    const title = target.dataset.helpTitle || target.textContent.trim();
+    let html = '<div class="help-tip-title">' + escapeHtml(title) + '</div>';
+    html += '<div class="help-tip-what">' + escapeHtml(entry.what) + '</div>';
+    if (calc) {
+        html += '<div class="help-tip-calc"><span class="help-tip-label">How it’s calculated</span>'
+            + escapeHtml(calc) + '</div>';
+    }
+    if (entry.note) {
+        html += '<div class="help-tip-note">' + escapeHtml(entry.note) + '</div>';
+    }
+    tip.innerHTML = html;
+    tip.classList.add("visible");
+    positionHelpTip(target, tip);
+}
+
+function positionHelpTip(target, tip) {
+    const rect = target.getBoundingClientRect();
+    const tipRect = tip.getBoundingClientRect();
+    const margin = 10;
+
+    let top = rect.bottom + 8;
+    // Headers are sticky at the top of a scrolling table, so below is almost
+    // always right; flip above only when the bottom of the window is closer.
+    if (top + tipRect.height > window.innerHeight - margin && rect.top > tipRect.height + margin) {
+        top = rect.top - tipRect.height - 8;
+    }
+    let left = rect.left + rect.width / 2 - tipRect.width / 2;
+    left = Math.max(margin, Math.min(left, window.innerWidth - tipRect.width - margin));
+
+    tip.style.top = Math.round(top) + "px";
+    tip.style.left = Math.round(left) + "px";
+}
+
+function hideHelpTip() {
+    if (helpTipEl) helpTipEl.classList.remove("visible");
+}
+
+// Delegated so it keeps working across every table rebuild -- the Positions
+// tables are torn down and recreated on each auto-refresh, and the Tranches
+// and Income tabs re-render wholesale.
+document.addEventListener("mouseover", (e) => {
+    const target = e.target.closest("[data-help]");
+    if (target) showHelpTip(target);
+});
+document.addEventListener("mouseout", (e) => {
+    if (e.target.closest("[data-help]")) hideHelpTip();
+});
+document.addEventListener("focusin", (e) => {
+    const target = e.target.closest("[data-help]");
+    if (target) showHelpTip(target);
+});
+document.addEventListener("focusout", (e) => {
+    if (e.target.closest("[data-help]")) hideHelpTip();
+});
+window.addEventListener("scroll", hideHelpTip, true);
 
 // Debug logging
 function log(msg) {
@@ -343,7 +665,9 @@ function renderColumnsModalBody(section) {
         });
 
         const name = document.createElement("span");
-        name.className = "col-name";
+        name.className = "col-name th-help";
+        name.dataset.help = def.key;
+        name.dataset.helpTitle = def.label;
         name.textContent = def.label + (pinned ? " (always shown)" : "");
 
         const width = document.createElement("input");
@@ -500,20 +824,20 @@ function exportToCSV() {
     showToast("Exported to CSV", "success");
 }
 
-function formatNumber(value, column) {
+function formatNumber(value, key) {
     if (value === "" || value === null || value === undefined) return "";
     const num = parseFloat(value);
     if (isNaN(num)) return value;
-    switch (column) {
-        case "Current Price":
-        case "Last Price":
-        case "Open":
-        case "Avg Price":
+    switch (key) {
+        case "current_price":
+        case "last_price":
+        case "open":
+        case "avg_price":
             return "$" + num.toFixed(2);
-        case "Daily Change $":
-        case "OGap":
+        case "daily_change_dollar":
+        case "ogap":
             return (num >= 0 ? "+" : "") + "$" + num.toFixed(2);
-        case "Daily Change %":
+        case "daily_change_pct":
             return (num >= 0 ? "+" : "") + (num * 100).toFixed(2) + "%";
         default:
             return num.toLocaleString();
@@ -593,7 +917,11 @@ function createTable(data, section) {
     const headerRow = document.createElement("tr");
     visibleCols.forEach(colDef => {
         const th = document.createElement("th");
-        th.appendChild(document.createTextNode(colDef.label));
+        const label = document.createElement("span");
+        label.className = "th-help";
+        label.dataset.help = colDef.key;
+        label.textContent = colDef.label;
+        th.appendChild(label);
         th.dataset.colKey = colDef.key;
         th.classList.add("sortable");
         th.addEventListener("click", (e) => {
@@ -620,7 +948,6 @@ function createTable(data, section) {
 
         visibleCols.forEach(colDef => {
             const td = document.createElement("td");
-            const header = colDef.label;
 
             if (colDef.key === "data_source") {
                 td.textContent = SOURCE_LABELS[source] || source;
@@ -640,7 +967,7 @@ function createTable(data, section) {
                     if (source === "cached") wrapper.classList.add("price-stale");
 
                     const priceText = document.createElement("span");
-                    priceText.textContent = formatNumber(cell, header);
+                    priceText.textContent = formatNumber(cell, colDef.key);
                     wrapper.appendChild(priceText);
 
                     // Only show dot when source is not IBKR (non-live data)
@@ -654,7 +981,7 @@ function createTable(data, section) {
                     if (change > 0) td.classList.add("positive");
                     if (change < 0) td.classList.add("negative");
                 } else {
-                    td.textContent = formatNumber(cell, header);
+                    td.textContent = formatNumber(cell, colDef.key);
                     if (["daily_change_dollar", "daily_change_pct", "ogap"].includes(colDef.key)) {
                         if (cell > 0) td.classList.add("positive");
                         if (cell < 0) td.classList.add("negative");
@@ -763,9 +1090,12 @@ function buildOptionDetailRow(symbol, opts, colspan) {
     td.colSpan = colspan;
 
     let html = '<table class="option-subtable"><thead><tr>' +
-        '<th>Contract</th><th>Pos</th><th>Strike</th><th>Expiry</th><th>DTE</th>' +
-        '<th>Delta</th><th>Theta</th><th>IV</th><th>Entry</th><th>Mark</th>' +
-        '<th>Prem. Left</th><th></th></tr></thead><tbody>';
+        helpTh("Contract", "opt.contract") + helpTh("Pos", "opt.pos") +
+        helpTh("Strike", "opt.strike") + helpTh("Expiry", "opt.expiry") +
+        helpTh("DTE", "opt.dte") + helpTh("Delta", "opt.delta") +
+        helpTh("Theta", "opt.theta") + helpTh("IV", "opt.iv") +
+        helpTh("Entry", "opt.entry") + helpTh("Mark", "opt.mark") +
+        helpTh("Prem. Left", "opt.prem_left") + '<th></th></tr></thead><tbody>';
     opts.forEach(o => {
         const short = (o.position || 0) < 0;
         const posClass = short ? "short-pos" : "long-pos";
@@ -1003,6 +1333,10 @@ async function updateTables() {
         log("Already refreshing, skipping");
         return;
     }
+    // The header a tooltip is anchored to gets destroyed by the rebuild below,
+    // which would leave the tooltip floating over nothing. It comes straight
+    // back on the next mouse move over the new header.
+    hideHelpTip();
     
     isRefreshing = true;
     setLoadingState(true);

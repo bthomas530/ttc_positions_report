@@ -119,8 +119,12 @@ function renderTranches(data) {
 
         if (group.open.length > 0) {
             html += '<div class="table-container"><table class="tranche-table">' +
-                '<thead><tr><th>Opened</th><th>Qty</th><th>Open Price</th><th>Premium</th>' +
-                '<th>Net Basis</th><th>Current</th><th>Unrealized P/L</th><th>Covering Call</th></tr></thead>' +
+                '<thead><tr>' +
+                helpTh("Opened", "tranche.opened") + helpTh("Qty", "tranche.qty") +
+                helpTh("Open Price", "tranche.open_price") + helpTh("Premium", "tranche.premium") +
+                helpTh("Net Basis", "tranche.net_basis") + helpTh("Current", "tranche.current") +
+                helpTh("Unrealized P/L", "tranche.unrealized") +
+                helpTh("Covering Call", "tranche.covering_call") + '</tr></thead>' +
                 '<tbody>' + openRows + '</tbody></table></div>';
         }
         if (group.closed.length > 0) {
@@ -128,8 +132,12 @@ function renderTranches(data) {
                 group.closed.length + ' closed tranche(s) — click to show</div>' +
                 '<div class="table-container closed-tranches" style="display:none">' +
                 '<table class="tranche-table">' +
-                '<thead><tr><th>Opened</th><th>Qty</th><th>Open Price</th><th>Premium</th>' +
-                '<th>Closed</th><th>Close Price</th><th>How</th><th>Realized P/L</th></tr></thead>' +
+                '<thead><tr>' +
+                helpTh("Opened", "tranche.opened") + helpTh("Qty", "tranche.qty") +
+                helpTh("Open Price", "tranche.open_price") + helpTh("Premium", "tranche.premium") +
+                helpTh("Closed", "tranche.closed") + helpTh("Close Price", "tranche.close_price") +
+                helpTh("How", "tranche.how") + helpTh("Realized P/L", "tranche.realized") +
+                '</tr></thead>' +
                 '<tbody>' + closedRows + '</tbody></table></div>';
         }
         html += '</div>'; // .section-content

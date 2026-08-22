@@ -35,10 +35,10 @@ function renderIncome(data) {
     const monthlyGoal = data.monthly_goal || 0;
 
     let cards = '<div class="income-cards">';
-    cards += incomeCard('Premium this week', thisWeek ? thisWeek.amount : 0, weeklyGoal, data.weekly_streak);
-    cards += incomeCard('Premium this month', thisMonth ? thisMonth.amount : 0, monthlyGoal, data.monthly_streak);
-    cards += incomeCard('Realized P/L (closed tranches)', data.realized_pl_closed || 0, 0);
-    cards += incomeCard('Unrealized P/L (open tranches)', data.unrealized_pl_open, 0);
+    cards += incomeCard('Premium this week', thisWeek ? thisWeek.amount : 0, weeklyGoal, data.weekly_streak, 'income.card_week');
+    cards += incomeCard('Premium this month', thisMonth ? thisMonth.amount : 0, monthlyGoal, data.monthly_streak, 'income.card_month');
+    cards += incomeCard('Realized P/L (closed tranches)', data.realized_pl_closed || 0, 0, null, 'income.card_realized');
+    cards += incomeCard('Unrealized P/L (open tranches)', data.unrealized_pl_open, 0, null, 'income.card_unrealized');
     cards += '</div>';
 
     const trendChart = renderTrendChart(weekly, weeklyGoal);
@@ -75,18 +75,22 @@ function renderIncome(data) {
         outcomesSection(data.outcomes) +
         '<div class="sections-container">' +
         section('Premium by symbol', 'fa-tags',
-            table(['Symbol', 'Premium'], bySymbol, 'No premium recorded yet.')) +
+            table([['Symbol', 'income.symbol'], ['Premium', 'income.premium_symbol']],
+                  bySymbol, 'No premium recorded yet.')) +
         section('Premium by week', 'fa-calendar-week',
-            table(['Week', 'Premium'], weekRows, 'No premium recorded yet.')) +
+            table([['Week', 'income.week'], ['Premium', 'income.premium_period']],
+                  weekRows, 'No premium recorded yet.')) +
         section('Premium by month', 'fa-calendar',
-            table(['Month', 'Premium'], monthRows, 'No premium recorded yet.')) +
+            table([['Month', 'income.month'], ['Premium', 'income.premium_period']],
+                  monthRows, 'No premium recorded yet.')) +
         section('Recent assignments', 'fa-right-left',
-            table(['Date', 'Symbol', 'What happened', 'Amount'], assignments,
-                  'No assignments in the imported history.')) +
+            table([['Date', 'income.assign_date'], ['Symbol', 'income.assign_symbol'],
+                   ['What happened', 'income.assign_what'], ['Amount', 'income.assign_amount']],
+                  assignments, 'No assignments in the imported history.')) +
         '</div>';
 }
 
-function incomeCard(label, amount, goal, streak) {
+function incomeCard(label, amount, goal, streak, helpKey) {
     let goalHtml = '';
     if (goal > 0 && amount !== null && amount !== undefined) {
         const pct = Math.min(100, Math.max(0, Math.round(100 * amount / goal)));
@@ -96,7 +100,8 @@ function incomeCard(label, amount, goal, streak) {
     }
     const known = amount !== null && amount !== undefined;
     const cls = !known ? '' : (amount >= 0 ? 'positive' : 'negative');
-    return '<div class="income-card"><span class="label">' + escapeHtml(label) + '</span>' +
+    return '<div class="income-card"><span class="label">' +
+        (helpKey ? helpLabel(label, helpKey) : escapeHtml(label)) + '</span>' +
         '<span class="value ' + cls + '">' + (known ? fmtMoney(amount, true) : '—') + '</span>' + goalHtml + '</div>';
 }
 
@@ -106,9 +111,9 @@ function incomeCard(label, amount, goal, streak) {
 function outcomesSection(outcomes) {
     if (!outcomes) return '';
     const defs = [
-        { key: 'expired', label: 'Expired worthless', icon: 'fa-hourglass-end', cls: 'positive' },
-        { key: 'bought_back', label: 'Bought back early', icon: 'fa-rotate-left', cls: 'negative' },
-        { key: 'assigned', label: 'Assigned', icon: 'fa-right-left', cls: '' },
+        { key: 'expired', label: 'Expired worthless', icon: 'fa-hourglass-end', cls: 'positive', help: 'income.outcome_expired' },
+        { key: 'bought_back', label: 'Bought back early', icon: 'fa-rotate-left', cls: 'negative', help: 'income.outcome_bought_back' },
+        { key: 'assigned', label: 'Assigned', icon: 'fa-right-left', cls: '', help: 'income.outcome_assigned' },
     ];
     const total = defs.reduce((sum, d) => sum + (outcomes[d.key]?.count || 0), 0);
     if (total === 0) return '';
@@ -117,7 +122,7 @@ function outcomesSection(outcomes) {
         return '<div class="outcome-chip">' +
             '<i class="fas ' + d.icon + '"></i>' +
             '<span class="outcome-count">' + o.count + '</span>' +
-            '<span class="outcome-label">' + d.label + '</span>' +
+            '<span class="outcome-label">' + helpLabel(d.label, d.help) + '</span>' +
             '<span class="outcome-amount ' + (o.amount >= 0 ? 'positive' : 'negative') + '">' + fmtMoney(o.amount, true) + '</span>' +
             '</div>';
     }).join("");
@@ -184,7 +189,7 @@ function table(headers, rows, emptyMessage) {
         return '<div class="no-results">' + escapeHtml(emptyMessage) + '</div>';
     }
     return '<table><thead><tr>' +
-        headers.map(h => '<th style="text-align:left">' + escapeHtml(h) + '</th>').join('') +
+        headers.map(h => helpTh(h[0], h[1], 'style="text-align:left"')).join('') +
         '</tr></thead><tbody>' + rows + '</tbody></table>';
 }
 
