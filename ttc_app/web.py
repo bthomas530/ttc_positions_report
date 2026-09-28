@@ -25,7 +25,7 @@ from ttc_app.config import (
 )
 from ttc_app.ibkr_manager import IBKRUnavailableError, probe_ib_ports
 from ttc_app.price_sources import fetch_cboe_prices, fetch_yahoo_prices, is_cusip
-from ttc_app.greeks import bs_greeks, implied_vol, years_to_expiry
+from ttc_app.greeks import MIN_VOL, bs_greeks, implied_vol, years_to_expiry
 from ttc_app.tranches import income_summary, option_open_dates, rebuild_tranches
 
 logger = logging.getLogger(__name__)
@@ -35,6 +35,9 @@ DEFAULT_BUYBACK_THRESHOLD_PCT = 15.0
 # expiry, gets an assignment-risk warning (ITM always does, inside the window).
 DEFAULT_ASSIGNMENT_WARN_PCT = 2.0
 DEFAULT_ASSIGNMENT_WARN_DTE = 7
+# No stock price tick from IBKR for this long while the market is open =
+# prices on screen are frozen (farm disconnect etc.), even if "connected".
+STALE_TICK_SECONDS = 120
 
 # Shared runtime state, populated by main.py
 state = SimpleNamespace(
@@ -291,6 +294,10 @@ def get_ibkr_data():
         'connection_source': 'ibkr',
         'options': options,
         'account': snapshot.get('account') or {},
+        'open_orders': snapshot.get('open_orders'),
+        'fills_today': snapshot.get('fills_today'),
+        'market_session': snapshot.get('market_session') or {},
+        'last_tick': snapshot.get('last_tick'),
     }
 
     # Symbols with options but no stock (cash-secured short puts, e.g.) must
@@ -382,6 +389,8 @@ def option_context(options, stock_positions):
         'covered_lots': covered_lots,
         'avg_costs': {p['symbol']: safe_number(p.get('avgCost'))
                       for p in stock_positions if safe_number(p.get('shares')) > 0},
+        'dividends': {},
+        'orders_by_conid': {},
     }
 
 
@@ -471,7 +480,8 @@ def build_option_row(opt, und_price, ctx):
             g = bs_greeks(und_price, strike, T, sigma, right)
             if g:
                 delta, theta = g['delta'], g['theta']
-                iv = sigma
+                # The MIN_VOL floor means "all intrinsic" -- not a real IV reading
+                iv = sigma if sigma and sigma > MIN_VOL else None
                 greeks_source = 'calc'
 
     unrealized_pl = None
@@ -491,7 +501,13 @@ def build_option_row(opt, und_price, ctx):
         if entry > 0 and total_days is not None:
             yield_ann = round(100 * entry / strike * 365 / max(total_days, 1), 1)
         if mark is not None and dte is not None:
-            yield_left_ann = round(100 * mark / strike * 365 / max(dte, 1), 1)
+            # Time value only: on an ITM option most of the mark is intrinsic
+            # that would be paid straight back, not premium still to earn.
+            intrinsic = 0.0
+            if und_price > 0:
+                intrinsic = max(0.0, (und_price - strike) if right == 'C' else (strike - und_price))
+            time_value = max(0.0, mark - intrinsic)
+            yield_left_ann = round(100 * time_value / strike * 365 / max(dte, 1), 1)
 
     assignment_risk = None
     if short and itm is not None and dte is not None and dte <= ctx['warn_dte']:
@@ -499,6 +515,9 @@ def build_option_row(opt, und_price, ctx):
             assignment_risk = 'itm'
         elif cushion_pct is not None and cushion_pct <= ctx['warn_pct']:
             assignment_risk = 'near'
+
+    exdiv = exdiv_assignment_risk(
+        short, right, und_price, strike, mark, expiry, ctx['dividends'].get(symbol))
 
     basis_flag, basis_ref = None, None
     if short and right == 'C':
@@ -536,6 +555,11 @@ def build_option_row(opt, und_price, ctx):
         'assignment_risk': assignment_risk,
         'basis_flag': basis_flag,
         'basis_ref': basis_ref,
+        'exdiv_risk': exdiv['risk'],
+        'exdiv_date': exdiv['date'],
+        'exdiv_amount': exdiv['amount'],
+        'extrinsic': exdiv['extrinsic'],
+        'working_orders': ctx['orders_by_conid'].get(conid, []),
         'open_date': open_ts[:10] if open_ts else None,
         'open_date_source': open_source,
         'yield_ann': yield_ann,
@@ -545,6 +569,64 @@ def build_option_row(opt, und_price, ctx):
         'iv': round(iv, 4) if iv else None,
         'greeks_source': greeks_source,
         'iv_source': iv_source,
+    }
+
+
+def exdiv_assignment_risk(short, right, und_price, strike, mark, expiry, dividend,
+                          today=None):
+    """Early-assignment risk on a written call from an upcoming dividend.
+
+    A call holder who wants the dividend exercises the day before the
+    ex-date -- and it's rational whenever the call's remaining time value
+    (extrinsic) is less than the dividend, because exercising gives up the
+    extrinsic but collects the dividend. So for an ITM short call with an
+    ex-date on or before expiry: 'likely' when extrinsic < dividend,
+    'possible' otherwise. OTM calls and puts: no dividend-driven risk."""
+    none = {'risk': None, 'date': None, 'amount': None, 'extrinsic': None}
+    if not short or right != 'C' or not dividend or not und_price or not strike:
+        return none
+    try:
+        ex_date = datetime.strptime(dividend.get('next_date') or '', '%Y-%m-%d').date()
+        exp_date = datetime.strptime((expiry or '')[:10], '%Y-%m-%d').date()
+    except ValueError:
+        return none
+    amount = safe_number(dividend.get('next_amount'))
+    today = today or datetime.now(pytz.timezone('America/New_York')).date()
+    if amount <= 0 or not (today <= ex_date <= exp_date):
+        return none
+    intrinsic = und_price - strike
+    if intrinsic <= 0:
+        return none
+    extrinsic = round(mark - intrinsic, 4) if mark is not None else None
+    risk = 'likely' if extrinsic is not None and extrinsic < amount else 'possible'
+    return {'risk': risk, 'date': ex_date.isoformat(), 'amount': amount,
+            'extrinsic': extrinsic}
+
+
+def data_freshness(connection_source, market_session, last_tick, now=None):
+    """Is the market open, and are IBKR prices actually still moving?"""
+    now = now or datetime.now(pytz.utc)
+    market_open = (market_session or {}).get('open')
+    session_source = 'ibkr' if market_open is not None else 'clock'
+    if market_open is None:
+        et = now.astimezone(pytz.timezone('America/New_York'))
+        minutes = et.hour * 60 + et.minute
+        market_open = et.weekday() < 5 and 570 <= minutes < 960
+    tick_age = None
+    if last_tick:
+        try:
+            tick_age = (now - datetime.fromisoformat(last_tick)).total_seconds()
+        except (TypeError, ValueError):
+            tick_age = None
+    stale = bool(connection_source == 'ibkr' and market_open
+                 and (tick_age is None or tick_age > STALE_TICK_SECONDS))
+    return {
+        'market_open': market_open,
+        'market_open_source': session_source,
+        'last_tick': last_tick,
+        'tick_age_seconds': round(tick_age) if tick_age is not None else None,
+        'stale': stale,
+        'stale_after_seconds': STALE_TICK_SECONDS,
     }
 
 
@@ -680,6 +762,10 @@ def enhance_with_market_data(basic_data):
     # Options grouped by underlying, with premium-remaining for shorts
     options = basic_data.get('options', [])
     ctx = option_context(options, basic_data.get('positions', []))
+    ctx['dividends'] = {sym: md.get('dividend') for sym, md in market_data.items()
+                        if md.get('dividend')}
+    for order in basic_data.get('open_orders') or []:
+        ctx['orders_by_conid'].setdefault(order.get('con_id'), []).append(order)
     options_by_symbol = {}
     for opt in options:
         symbol = opt.get('symbol')
@@ -702,6 +788,12 @@ def enhance_with_market_data(basic_data):
         'portfolio': portfolio_summary(
             options_by_symbol, basic_data.get('account') or {},
             has_options_data=connection_source == 'ibkr'),
+        # None = couldn't fetch (IBKR down / timed out), [] = genuinely none
+        'open_orders': basic_data.get('open_orders'),
+        'fills_today': basic_data.get('fills_today'),
+        'freshness': data_freshness(
+            connection_source, basic_data.get('market_session'),
+            basic_data.get('last_tick')),
     }
 
 
@@ -800,6 +892,27 @@ def get_data():
             'positions': [], 'incomplete_lots': [], 'watchlist': [],
             'connection_source': 'unavailable',
         }), 500
+
+
+@app.route('/api/orders/stage-close', methods=['POST'])
+def api_stage_close():
+    """Stage (never transmit) a closing order for one option position in TWS."""
+    payload = request.get_json(silent=True) or {}
+    try:
+        conid = int(payload.get('conId'))
+    except (TypeError, ValueError):
+        return jsonify({'ok': False, 'error': 'Missing contract id.'}), 400
+    if state.ibkr is None:
+        return jsonify({'ok': False, 'error': 'IBKR is not connected.'}), 503
+    try:
+        result = state.ibkr.stage_close_order(conid)
+    except IBKRUnavailableError as e:
+        return jsonify({'ok': False, 'error': str(e)}), 503
+    except Exception as e:
+        logger.error(f'Staging close order failed for {conid}: {e}', exc_info=True)
+        return jsonify({'ok': False, 'error': str(e)}), 500
+    logger.info(f'Stage close conId={conid}: {result}')
+    return jsonify(result), (200 if result.get('ok') else 409)
 
 
 @app.route('/api/test')

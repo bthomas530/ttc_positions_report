@@ -264,6 +264,11 @@ class TestGreeksFallback:
         assert row['iv_source'] == 'implied'
         assert row['iv'] != 0.9
 
+    def test_deep_itm_gets_delta_but_no_fake_iv(self):
+        call = dict(short_put('MSFT', 420, 9, 4.0, 10.30, 'live'), right='C')
+        row = enhance_options([call], {'MSFT': {'last': 430}})['MSFT'][0]
+        assert row['delta'] == pytest.approx(1.0, abs=1e-3) and row['iv'] is None
+
     def test_no_vol_leaves_blank(self):
         opt = dict(short_put('AAPL', 310, 10, 2.0, None, None), conId=42)
         row = enhance_options([opt], {'AAPL': {'last': 320}})['AAPL'][0]
@@ -294,6 +299,11 @@ class TestPnlAndYield:
         row = enhance_options([opt], first_seen={9: '2026-10-06T09:00:00'})['AAPL'][0]
         assert row['open_date_source'] == 'first_seen'
         assert row['yield_ann'] == pytest.approx(36.5)
+
+    def test_yield_left_uses_time_value_only(self):
+        call = dict(short_put('MSFT', 420, 9, 4.0, 10.30), right='C')
+        row = enhance_options([call], {'MSFT': {'last': 430}})['MSFT'][0]
+        assert row['yield_left_ann'] == pytest.approx(round(100 * 0.30 / 420 * 365 / 9, 1))
 
     def test_no_yield_for_longs(self):
         opt = dict(short_put('AAPL', 100, 20, 1.0, 0.5), position=5)
@@ -390,3 +400,87 @@ class TestTranchesBasisFlag:
             body = c.get('/api/tranches').get_json()
         row = body['groups'][0]['open'][0]
         assert row['call_basis_flag'] == 'loss' and row['call_basis_ref'] == 98.0
+
+
+class TestExDividendRisk:
+    def row(self, mark, ex_days=3, und=110, expiry_days=10, amount=0.5, right='C'):
+        from datetime import date, timedelta
+        opt = dict(short_put('AAPL', 100, expiry_days, 2.0, mark), right=right)
+        div = {'next_date': (date.today() + timedelta(days=ex_days)).isoformat(),
+               'next_amount': amount}
+        return enhance_options([opt], {'AAPL': {'last': und, 'dividend': div}})['AAPL'][0]
+
+    def test_likely_when_extrinsic_below_dividend(self):
+        r = self.row(mark=10.2)   # intrinsic 10, extrinsic 0.2 < 0.5
+        assert r['exdiv_risk'] == 'likely' and r['extrinsic'] == pytest.approx(0.2)
+
+    def test_possible_when_time_value_exceeds_dividend(self):
+        assert self.row(mark=11.0)['exdiv_risk'] == 'possible'
+
+    def test_none_cases(self):
+        assert self.row(mark=1.0, und=95)['exdiv_risk'] is None          # OTM
+        assert self.row(mark=10.2, ex_days=20)['exdiv_risk'] is None     # after expiry
+        assert self.row(mark=10.2, ex_days=-1)['exdiv_risk'] is None     # already passed
+        assert self.row(mark=10.2, right='P', und=90)['exdiv_risk'] is None
+
+
+class TestFreshness:
+    def at(self, h, m, day=28):
+        import pytz
+        from datetime import datetime
+        return pytz.utc.localize(datetime(2026, 9, day, h, m))
+
+    def test_stale_when_no_ticks_in_session(self):
+        f = web.data_freshness('ibkr', {'open': True}, self.at(14, 0).isoformat(), now=self.at(14, 5))
+        assert f['stale'] is True and f['tick_age_seconds'] == 300
+
+    def test_fresh_and_closed(self):
+        assert web.data_freshness('ibkr', {'open': True}, self.at(14, 4).isoformat(),
+                                  now=self.at(14, 5))['stale'] is False
+        # holiday per IBKR calendar: silence is expected
+        assert web.data_freshness('ibkr', {'open': False}, None, now=self.at(14, 5))['stale'] is False
+
+    def test_clock_fallback_and_non_ibkr(self):
+        f = web.data_freshness('ibkr', {}, None, now=self.at(14, 5))   # Mon 10:05 ET
+        assert f['market_open'] is True and f['market_open_source'] == 'clock' and f['stale']
+        assert web.data_freshness('yahoo', {'open': True}, None, now=self.at(14, 5))['stale'] is False
+
+
+class TestOrdersAttach:
+    def test_orders_matched_to_contract(self):
+        order = {'con_id': 42, 'action': 'BUY', 'quantity': 5, 'status': 'Submitted'}
+        opt = dict(short_put('AAPL', 310, 10, 2.0, 1.0), conId=42)
+        other = dict(short_put('AAPL', 300, 10, 2.0, 1.0), conId=43)
+        data = enhance([opt, other])
+        assert data['open_orders'] is None
+        web.state.db = FakeDB()
+        web.state.db.get_setting = lambda key, default=None: default
+        data = web.enhance_with_market_data({
+            'positions': [], 'incomplete_lots': [], 'watchlist': [], 'market_data': {},
+            'options': [opt, other], 'open_orders': [order], 'fills_today': []})
+        rows = {r['conId']: r for r in data['options_by_symbol']['AAPL']}
+        assert rows[42]['working_orders'] == [order] and rows[43]['working_orders'] == []
+        assert data['fills_today'] == []
+
+
+class TestStageCloseRoute:
+    def test_routes_to_manager(self):
+        calls = []
+
+        class Mgr:
+            def stage_close_order(self, conid):
+                calls.append(conid)
+                return {'ok': True, 'description': 'BUY 5 X @ 0.05 LMT'}
+        web.state.ibkr = Mgr()
+        with web.app.test_client() as c:
+            r = c.post('/api/orders/stage-close', json={'conId': '42'})
+            assert r.status_code == 200 and calls == [42]
+            assert c.post('/api/orders/stage-close', json={}).status_code == 400
+
+    def test_manager_refusal_is_409(self):
+        class Mgr:
+            def stage_close_order(self, conid):
+                return {'ok': False, 'error': 'read-only'}
+        web.state.ibkr = Mgr()
+        with web.app.test_client() as c:
+            assert c.post('/api/orders/stage-close', json={'conId': 1}).status_code == 409

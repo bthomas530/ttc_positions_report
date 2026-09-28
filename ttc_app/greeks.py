@@ -73,8 +73,16 @@ def implied_vol(price, S, K, T, right, r=RISK_FREE_RATE):
     if not price or price <= 0 or S <= 0 or K <= 0 or not T or T <= 0:
         return None
     lo, hi = MIN_VOL, MAX_VOL
-    if price < bs_price(S, K, T, lo, right, r) or price > bs_price(S, K, T, hi, right, r):
+    if price > bs_price(S, K, T, hi, right, r):
         return None
+    if price < bs_price(S, K, T, lo, right, r):
+        # A deep-ITM option trading at (or a hair above) plain intrinsic sits
+        # below the European no-arbitrage floor once interest is counted --
+        # American exercise and dividends allow it. It's "all intrinsic, no
+        # time value", i.e. the lowest vol; only a price under intrinsic
+        # itself (a stale quote after a move) is truly unusable.
+        intrinsic = max(0.0, S - K) if right == 'C' else max(0.0, K - S)
+        return MIN_VOL if intrinsic > 0 and price >= intrinsic - 0.005 else None
     for _ in range(100):
         mid = 0.5 * (lo + hi)
         if bs_price(S, K, T, mid, right, r) < price:

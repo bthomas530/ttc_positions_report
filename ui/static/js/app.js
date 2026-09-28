@@ -2,6 +2,7 @@
 // TTC Positions Report - Frontend JavaScript (core + Positions tab)
 
 let isRefreshing = false;
+let refreshQueued = false;
 // Sort state is per-section (positions/incomplete/watchlist each sort
 // independently) and keyed by column key, not raw index, since hide/reorder
 // changes which index a column renders at between refreshes.
@@ -9,6 +10,8 @@ let currentSort = { positions: null, incomplete: null, watchlist: null };
 let refreshInterval;
 let cachedData = null;
 let optionsBySymbol = {};
+let ordersBySymbol = {};
+let lastSuccessfulUpdate = null;
 // Which Positions rows have their option sub-table open. Lives outside the
 // table so the periodic rebuild can re-apply it -- otherwise every
 // auto-refresh snapped every expanded row shut.
@@ -151,7 +154,7 @@ const COLUMN_HELP = {
     // ---- Positions / Incomplete Lots / Watchlist ----
     underlying: {
         what: "The stock this row is about. Click the ticker to open it on TradingView.",
-        note: "A number badge means this symbol has open option contracts — click the row to expand them. Other badges: BUYBACK (a written option hit the buyback threshold), EXPIRES TODAY / EXPIRES · ITM (expiration day), ITM · 3d / NEAR · 3d (a written option is in the money or close to its strike, with days left), BELOW COST (a covered call's strike is under what the shares cost). Hover any badge for the details.",
+        note: "A number badge means this symbol has open option contracts — click the row to expand them. Other badges: BUYBACK (a written option hit the buyback threshold), EXPIRES TODAY / EXPIRES · ITM (expiration day), ITM · 3d / NEAR · 3d (a written option is in the money or close to its strike, with days left), BELOW COST (a covered call's strike is under what the shares cost), EX-DIV (a written call in the money before an ex-dividend date — early assignment risk), ORDER / STAGED (a working order, or one staged in TWS but not yet transmitted). Hover any badge for the details.",
     },
     shares: {
         what: "Shares of the stock currently held. Negative means a short stock position.",
@@ -265,7 +268,7 @@ const COLUMN_HELP = {
     },
     "opt.yield_left": {
         what: "The annualized return still left in this written option if held to expiry. When it's low, the collateral may earn more in a new trade.",
-        calc: "Mark ÷ Strike × 365 ÷ days to expiry (at least 1). Compare it to the Yield of a fresh trade you'd open instead.",
+        calc: "Time value left ÷ Strike × 365 ÷ days to expiry (at least 1). Time value = Mark minus any in-the-money amount, since that part isn't premium still to be earned. Compare it to the Yield of a fresh trade you'd open instead.",
     },
 
     // ---- Tranches tab: open lots ----
@@ -570,7 +573,9 @@ function notifyAssignmentRisk(data) {
     Object.entries(data.options_by_symbol || {}).forEach(([symbol, opts]) => {
         opts.forEach(o => {
             if (!o.conId) return;
-            const level = o.expiring && o.itm ? "itm" : o.assignment_risk;
+            const levels = [o.expiring && o.itm ? "itm" : null, o.assignment_risk,
+                o.exdiv_risk === "likely" ? "itm" : (o.exdiv_risk ? "near" : null)];
+            const level = levels.reduce((best, l) => (RISK_RANK[l] || 0) > (RISK_RANK[best] || 0) ? l : best, null);
             const prev = notifiedRisk.get(o.conId);
             if (level && (RISK_RANK[level] || 0) > (RISK_RANK[prev] || 0)) {
                 worsened.push({ symbol, o, level });
@@ -579,8 +584,10 @@ function notifyAssignmentRisk(data) {
         });
     });
     if (worsened.length === 0) return;
-    const lines = worsened.map(({ symbol, o, level }) =>
-        "<b>" + escapeHtml(symbol) + "</b> " + escapeHtml(contractLabel(o)) + " — " +
+    const lines = worsened.map(({ symbol, o, level }) => o.exdiv_risk && !o.assignment_risk && !o.expiring
+        ? "<b>" + escapeHtml(symbol) + "</b> " + escapeHtml(contractLabel(o)) + " — ex-dividend " + escapeHtml(shortDate(o.exdiv_date)) +
+          ", early assignment " + (o.exdiv_risk === "likely" ? "LIKELY" : "possible")
+        : "<b>" + escapeHtml(symbol) + "</b> " + escapeHtml(contractLabel(o)) + " — " +
         (level === "itm" ? "IN THE MONEY by " + Math.abs(o.cushion_pct || 0).toFixed(1) + "%"
                          : "only " + Math.abs(o.cushion_pct || 0).toFixed(1) + "% from the strike") + ", " +
         (o.dte <= 0 ? "expires today" : o.dte + "d left"));
@@ -603,12 +610,19 @@ function updateMarketStatus() {
     const textEl = statusEl.querySelector(".status-text");
     
     const isWeekend = day === 0 || day === 6;
-    const isOpen = !isWeekend && totalMinutes >= marketOpen && totalMinutes < marketClose;
-    
+    const clockOpen = !isWeekend && totalMinutes >= marketOpen && totalMinutes < marketClose;
+    // IBKR's own trading calendar knows holidays and half days; the clock doesn't.
+    const fresh = cachedData && cachedData.freshness;
+    const ibkrSaysClosed = clockOpen && fresh && fresh.market_open_source === "ibkr" && fresh.market_open === false;
+    const isOpen = clockOpen && !ibkrSaysClosed;
+
     statusEl.classList.remove("open", "closed");
     statusEl.classList.add(isOpen ? "open" : "closed");
-    
-    if (isOpen) {
+
+    if (ibkrSaysClosed) {
+        textEl.textContent = "Market Closed";
+        countdownEl.textContent = "holiday / early close";
+    } else if (isOpen) {
         textEl.textContent = "Market Open";
         const remaining = marketClose - totalMinutes;
         countdownEl.textContent = "Closes in " + Math.floor(remaining / 60) + "h " + (remaining % 60) + "m";
@@ -1117,6 +1131,16 @@ function createTable(data, section) {
                     firstTd.appendChild(riskBadge);
                 }
 
+                const exdiv = opts.filter(o => o.exdiv_risk);
+                if (exdiv.length > 0) {
+                    const likely = exdiv.some(o => o.exdiv_risk === "likely");
+                    const divBadge = document.createElement("span");
+                    divBadge.className = "expiry-badge collapsed-hint " + (likely ? "itm" : "near");
+                    divBadge.textContent = "EX-DIV · " + shortDate(exdiv[0].exdiv_date);
+                    divBadge.title = exdiv.map(exdivDescription).join("\n");
+                    firstTd.appendChild(divBadge);
+                }
+
                 const belowCost = opts.filter(o => o.basis_flag);
                 if (belowCost.length > 0) {
                     const costBadge = document.createElement("span");
@@ -1125,6 +1149,16 @@ function createTable(data, section) {
                     costBadge.textContent = "BELOW COST";
                     costBadge.title = belowCost.map(basisDescription).join("\n");
                     firstTd.appendChild(costBadge);
+                }
+
+                const symOrders = ordersBySymbol[symbol] || [];
+                if (symOrders.length > 0) {
+                    const orderBadge = document.createElement("span");
+                    const staged = symOrders.some(o => !o.transmitted);
+                    orderBadge.className = "order-badge collapsed-hint" + (staged ? " staged" : "");
+                    orderBadge.textContent = staged ? "STAGED" : "ORDER";
+                    orderBadge.title = symOrders.map(orderDescription).join("\n");
+                    firstTd.appendChild(orderBadge);
                 }
 
                 const expander = document.createElement("i");
@@ -1208,6 +1242,33 @@ function setOptionRowExpanded(symbol, open) {
     tr.classList.toggle("expanded", open);
 }
 
+function shortDate(iso) {
+    if (!iso) return "?";
+    const d = new Date(iso + "T12:00:00");
+    return d.toLocaleDateString("en-US", { weekday: "short", month: "short", day: "numeric" });
+}
+
+function exdivDescription(o) {
+    const ext = (o.extrinsic === null || o.extrinsic === undefined) ? "unknown" : "$" + Number(o.extrinsic).toFixed(2);
+    const head = contractLabel(o) + ": ex-dividend " + shortDate(o.exdiv_date) + " ($" + Number(o.exdiv_amount).toFixed(2) + "/share). ";
+    return o.exdiv_risk === "likely"
+        ? head + "Time value left is only " + ext + " — less than the dividend, so early assignment the day before is LIKELY (shares called away, dividend lost)."
+        : head + "It's in the money, so early assignment is possible; time value left (" + ext + ") is more than the dividend, which makes it less likely.";
+}
+
+function orderContract(o) {
+    if (o.sec_type !== "OPT") return o.symbol;
+    return o.symbol + " $" + Number(o.strike || 0).toFixed(2) + " " + (o.right === "P" ? "put" : "call") + " " + (o.expiry || "");
+}
+
+function orderDescription(o) {
+    const qty = Number(o.quantity || 0);
+    const price = o.limit_price !== null && o.limit_price !== undefined ? " @ $" + Number(o.limit_price).toFixed(2) : "";
+    return o.action + " " + qty + " " + orderContract(o) + " " + (o.order_type || "") + price +
+        (o.filled ? " (" + Number(o.filled) + " filled)" : "") +
+        (o.transmitted ? " — " + o.status : " — STAGED in TWS, not sent: review and Transmit there");
+}
+
 function contractLabel(o) {
     return Math.abs(o.position || 0) + "× $" + Number(o.strike || 0).toFixed(2) + " " +
         (o.right === "P" ? "put" : "call") + " " + (o.expiry || "");
@@ -1284,6 +1345,23 @@ function buildOptionDetailRow(symbol, opts, colspan) {
         if (o.basis_flag) {
             flags.push('<span class="expiry-badge ' + (o.basis_flag === "loss" ? "itm" : "near") + '" title="' +
                 escapeHtml(basisDescription(o)) + '">BELOW COST</span>');
+        }
+        if (o.exdiv_risk) {
+            flags.push('<span class="expiry-badge ' + (o.exdiv_risk === "likely" ? "itm" : "near") + '" title="' +
+                escapeHtml(exdivDescription(o)) + '">EX-DIV ' + escapeHtml(shortDate(o.exdiv_date)) + '</span>');
+        }
+        const working = o.working_orders || [];
+        working.forEach(w => {
+            flags.push('<span class="order-badge' + (w.transmitted ? "" : " staged") + '" title="' + escapeHtml(orderDescription(w)) + '">' +
+                (w.transmitted ? escapeHtml(w.action + " " + Number(w.quantity) + (w.limit_price ? " @ " + Number(w.limit_price).toFixed(2) : "")) : "STAGED IN TWS") +
+                '</span>');
+        });
+        if (working.length === 0 && o.conId && (o.position || 0) !== 0) {
+            const risky = o.assignment_risk || o.exdiv_risk || o.buyback_target_hit || (o.expiring && o.itm);
+            flags.push('<button type="button" class="stage-btn' + (risky ? " emphasis" : "") + '" data-conid="' + escapeHtml(o.conId) +
+                '" title="Put a ' + (short ? "buy" : "sell") + '-to-close limit order for all ' + Math.abs(o.position) +
+                ' contracts into TWS WITHOUT sending it. Review the price in TWS and click Transmit there (or delete it).">' +
+                '<i class="fas fa-arrow-up-right-from-square"></i> Close in TWS</button>');
         }
         const calc = o.greeks_source === "calc";
         const greek = (v, digits) => (v === null || v === undefined) ? "—"
@@ -1446,6 +1524,113 @@ function updateSummaryStats(data) {
     plEl.className = "stat-value " + (dailyPL >= 0 ? "positive" : "negative");
 }
 
+function renderActivity(data) {
+    const el = document.getElementById("activity-table");
+    const countEl = document.getElementById("activity-count");
+    if (data.fallback || (data.open_orders === undefined && data.fills_today === undefined)) {
+        el.innerHTML = '<div class="no-results">Orders and fills come straight from TWS — shown once IBKR is connected.</div>';
+        countEl.textContent = "–";
+        return;
+    }
+    const orders = data.open_orders, fills = data.fills_today;
+    countEl.textContent = (orders || []).length + (fills || []).length;
+    let html = '<div class="activity-grid"><div><h3 class="activity-title">Working orders</h3>';
+    if (orders === null) {
+        html += '<div class="no-results small">Couldn’t read orders from TWS on this refresh.</div>';
+    } else if (orders.length === 0) {
+        html += '<div class="no-results small">No working orders.</div>';
+    } else {
+        html += '<table class="activity-table"><thead><tr><th>Contract</th><th>Side</th><th>Qty</th><th>Type</th><th>Limit</th><th>Status</th></tr></thead><tbody>' +
+            orders.map(o => '<tr' + (o.transmitted ? '' : ' class="staged-row"') + '>' +
+                '<td>' + escapeHtml(orderContract(o)) + '</td>' +
+                '<td class="' + (o.action === "BUY" ? "long-pos" : "short-pos") + '">' + escapeHtml(o.action) + '</td>' +
+                '<td>' + escapeHtml(Number(o.filled || 0) ? Number(o.filled) + "/" + Number(o.quantity) : Number(o.quantity)) + '</td>' +
+                '<td>' + escapeHtml((o.order_type || "") + " " + (o.tif || "")) + '</td>' +
+                '<td>' + (o.limit_price !== null && o.limit_price !== undefined ? fmtMoney(o.limit_price) : "—") + '</td>' +
+                '<td>' + (o.transmitted ? escapeHtml(o.status) : '<span class="order-badge staged" title="Sitting in TWS unsent — review and click Transmit there, or delete it">STAGED · NOT SENT</span>') + '</td>' +
+                '</tr>').join("") + '</tbody></table>';
+    }
+    html += '</div><div><h3 class="activity-title">Fills today</h3>';
+    if (fills === null) {
+        html += '<div class="no-results small">Couldn’t read today’s fills from TWS on this refresh.</div>';
+    } else if (fills.length === 0) {
+        html += '<div class="no-results small">No fills yet today.</div>';
+    } else {
+        html += '<table class="activity-table"><thead><tr><th>Time</th><th>Contract</th><th>Side</th><th>Qty</th><th>Price</th><th>Comm.</th><th>Realized</th></tr></thead><tbody>' +
+            fills.map(f => '<tr>' +
+                '<td>' + escapeHtml(f.time ? new Date(f.time).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "—") + '</td>' +
+                '<td>' + escapeHtml(orderContract(f)) + '</td>' +
+                '<td class="' + (f.side === "BUY" ? "long-pos" : "short-pos") + '">' + escapeHtml(f.side) + '</td>' +
+                '<td>' + escapeHtml(Number(f.quantity)) + '</td>' +
+                '<td>' + fmtMoney(f.price) + '</td>' +
+                '<td>' + (f.commission !== null && f.commission !== undefined ? fmtMoney(-Math.abs(f.commission)) : "—") + '</td>' +
+                '<td>' + (f.realized_pl === null || f.realized_pl === undefined ? "—"
+                    : '<span class="' + (f.realized_pl >= 0 ? "positive" : "negative") + '">' + fmtMoney(f.realized_pl, true) + '</span>') + '</td>' +
+                '</tr>').join("") + '</tbody></table>';
+    }
+    html += '</div></div>';
+    el.innerHTML = html;
+}
+
+// Loud warning when the numbers on screen may not be current. Two separate
+// failure modes: (1) the backend says IBKR prices stopped ticking during
+// market hours even though the socket is "connected"; (2) this page itself
+// hasn't completed a refresh in a while (hung request, refresh turned off).
+function updateFreshnessBanner() {
+    const existing = document.getElementById("staleBanner");
+    const data = cachedData;
+    const fresh = data && data.freshness;
+    const marketOpen = fresh ? fresh.market_open : false;
+    const refreshSecs = parseInt(document.getElementById("refreshRate").value) || 0;
+    const sinceUpdate = lastSuccessfulUpdate ? (Date.now() - lastSuccessfulUpdate) / 1000 : null;
+    const allowed = refreshSecs > 0 ? Math.max(150, refreshSecs * 3) : 300;
+    const mins = s => Math.max(1, Math.round(s / 60)) + " min";
+
+    let message = null;
+    if (fresh && fresh.stale) {
+        message = fresh.tick_age_seconds === null || fresh.tick_age_seconds === undefined
+            ? "Prices may be FROZEN: IBKR hasn’t sent any price updates while the market is open. Check TWS before trading off these numbers."
+            : "Prices may be FROZEN: no price update from IBKR in " + mins(fresh.tick_age_seconds) + " while the market is open. Check TWS before trading off these numbers.";
+    } else if (marketOpen && sinceUpdate !== null && sinceUpdate > allowed) {
+        message = "Last successful update was " + mins(sinceUpdate) + " ago" +
+            (refreshSecs > 0 ? " — refreshes are failing." : " — auto-refresh is off.") + " These numbers may be out of date.";
+    }
+    document.getElementById("lastUpdate").classList.toggle("stale", !!message);
+    if (!message) { if (existing) existing.remove(); return; }
+    const banner = existing || document.createElement("div");
+    banner.id = "staleBanner";
+    banner.className = "stale-banner";
+    banner.innerHTML = '<i class="fas fa-triangle-exclamation"></i> <span></span> <button type="button" class="fallback-why-link">Refresh now</button>';
+    banner.querySelector("span").textContent = message;
+    banner.querySelector("button").onclick = () => updateTables();
+    if (!existing) {
+        const header = document.querySelector(".header");
+        header.parentElement.insertBefore(banner, header.nextSibling);
+    }
+}
+
+async function stageCloseOrder(btn) {
+    const conid = btn.dataset.conid;
+    btn.disabled = true;
+    btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Staging…';
+    try {
+        const response = await fetch("/api/orders/stage-close", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ conId: conid }),
+        });
+        const result = await response.json();
+        if (!result.ok) throw new Error(result.error || "TWS refused the order");
+        showToast("Staged in TWS (not sent): " + escapeHtml(result.description) +
+            "<br>Review the price in TWS’s Orders panel and click Transmit — or delete it.", "success", 0, "actions");
+        btn.innerHTML = '<i class="fas fa-check"></i> Staged';
+        setTimeout(updateTables, 800);
+    } catch (e) {
+        showToast("Couldn’t stage the order: " + escapeHtml(e.message), "error", 0, "errors");
+        btn.disabled = false;
+        btn.innerHTML = '<i class="fas fa-arrow-up-right-from-square"></i> Close in TWS';
+    }
+}
+
 // Put exposure = what it would cost to buy the shares if every written put
 // were assigned at once, against the account's cash.
 function updatePortfolioCards(portfolio) {
@@ -1583,7 +1768,10 @@ function updateConnectionStatus(data) {
 async function updateTables() {
     log("updateTables called");
     if (isRefreshing) {
-        log("Already refreshing, skipping");
+        // Don't drop it: a refresh asked for mid-flight (e.g. right after
+        // staging an order) must still happen, just once the current one ends.
+        log("Already refreshing, queued");
+        refreshQueued = true;
         return;
     }
     // The header a tooltip is anchored to gets destroyed by the rebuild below,
@@ -1615,6 +1803,8 @@ async function updateTables() {
         const watchlistTable = document.getElementById("watchlist-table");
 
         optionsBySymbol = data.options_by_symbol || {};
+        ordersBySymbol = {};
+        (data.open_orders || []).forEach(o => (ordersBySymbol[o.symbol] = ordersBySymbol[o.symbol] || []).push(o));
 
         positionsTable.innerHTML = data.positions.length > 0 ? "" : '<div class="no-results">No positions found</div>';
         incompleteTable.innerHTML = data.incomplete_lots.length > 0 ? "" : '<div class="no-results">No incomplete lots</div>';
@@ -1627,6 +1817,10 @@ async function updateTables() {
         updateLastUpdateTime();
         updateSummaryStats(data);
         updatePortfolioCards(data.portfolio);
+        renderActivity(data);
+        lastSuccessfulUpdate = Date.now();
+        updateFreshnessBanner();
+        updateMarketStatus();
         notifyAssignmentRisk(data);
         updateSectionCounts(data);
         updateConnectionStatus(data);
@@ -1650,6 +1844,10 @@ async function updateTables() {
     } finally {
         isRefreshing = false;
         setLoadingState(false);
+        if (refreshQueued) {
+            refreshQueued = false;
+            updateTables();
+        }
     }
 }
 
@@ -1781,6 +1979,11 @@ document.addEventListener("DOMContentLoaded", () => {
     });
     document.getElementById("columnsResetBtn").addEventListener("click", resetColumnsToDefault);
     document.getElementById("statExpiringCard").addEventListener("click", expandExpiringThisWeek);
+    document.getElementById("positions-table").addEventListener("click", (e) => {
+        const btn = e.target.closest(".stage-btn");
+        if (btn) { e.stopPropagation(); stageCloseOrder(btn); }
+    });
+    setInterval(updateFreshnessBanner, 15000);
 
     initTabs();
 

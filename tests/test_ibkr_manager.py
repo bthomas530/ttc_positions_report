@@ -9,6 +9,10 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ttc_app.ibkr_manager import (
+    fill_to_dict,
+    order_to_dict,
+    parse_liquid_hours,
+    staged_close_price,
     account_summary,
     BACKOFF_CAP,
     IBKRManager,
@@ -171,3 +175,114 @@ class TestAccountSummary:
 
     def test_empty(self):
         assert account_summary(None) == {}
+
+
+class TestParseLiquidHours:
+    HOURS = '20260928:0930-20260928:1600;20260929:CLOSED;20260930:0930-20260930:1300'
+
+    def at(self, y, m, d, hh, mm):
+        # given in UTC; Sep = EDT (UTC-4)
+        import pytz
+        return pytz.utc.localize(__import__('datetime').datetime(y, m, d, hh, mm))
+
+    def test_open_and_closed_times(self):
+        assert parse_liquid_hours(self.HOURS, 'US/Eastern', self.at(2026, 9, 28, 14, 0)) is True
+        assert parse_liquid_hours(self.HOURS, 'US/Eastern', self.at(2026, 9, 28, 12, 0)) is False
+        assert parse_liquid_hours(self.HOURS, 'US/Eastern', self.at(2026, 9, 28, 20, 30)) is False
+
+    def test_holiday_and_half_day(self):
+        assert parse_liquid_hours(self.HOURS, 'US/Eastern', self.at(2026, 9, 29, 15, 0)) is False
+        assert parse_liquid_hours(self.HOURS, 'US/Eastern', self.at(2026, 9, 30, 16, 30)) is True
+        assert parse_liquid_hours(self.HOURS, 'US/Eastern', self.at(2026, 9, 30, 17, 30)) is False
+
+    def test_unknown_day_or_garbage(self):
+        assert parse_liquid_hours(self.HOURS, 'US/Eastern', self.at(2026, 10, 5, 15, 0)) is None
+        assert parse_liquid_hours('', None, self.at(2026, 9, 28, 15, 0)) is None
+
+
+class TestStagedClosePrice:
+    def test_buy_rounds_up_from_ask(self):
+        assert staged_close_price('BUY', 0.03, 0.051, 0.04) == 0.06
+        assert staged_close_price('BUY', 4.0, 4.12, 4.05) == 4.15
+        assert staged_close_price('BUY', 0, 0.05, 0.03) == 0.05
+
+    def test_buy_without_quotes(self):
+        assert staged_close_price('BUY', 0, 0, 0.022) == 0.03
+        assert staged_close_price('BUY', 0, 0, 0) == 0.01
+
+    def test_sell_rounds_down_from_bid(self):
+        assert staged_close_price('SELL', 3.12, 3.30, 3.2) == 3.10
+        assert staged_close_price('SELL', 0, 0, 0) is None
+
+
+class TestOrderAndFillDicts:
+    def test_order(self):
+        from types import SimpleNamespace as N
+        trade = N(contract=N(conId=5, symbol='AAPL', secType='OPT', right='P', strike=310.0,
+                             lastTradeDateOrContractMonth='20261016'),
+                  order=N(orderId=7, permId=99, action='BUY', totalQuantity=5.0,
+                          orderType='LMT', lmtPrice=0.05, tif='DAY', transmit=False,
+                          orderRef='TTC staged close'),
+                  orderStatus=N(status='Inactive', filled=0.0))
+        d = order_to_dict(trade)
+        assert d['expiry'] == '2026-10-16' and d['limit_price'] == 0.05
+        assert d['transmitted'] is False and d['staged_by_app'] is True
+
+    def test_fill_unset_values(self):
+        from datetime import datetime
+        from types import SimpleNamespace as N
+        fill = N(contract=N(symbol='AAPL', secType='STK', right='', strike=0.0,
+                            lastTradeDateOrContractMonth=''),
+                 execution=N(execId='x1', time=datetime(2026, 9, 28, 14, 0), side='SLD',
+                             shares=100.0, price=341.2, orderRef=''),
+                 commissionReport=N(commission=1.0, realizedPNL=1.7976931348623157e+308))
+        d = fill_to_dict(fill)
+        assert d['side'] == 'SELL' and d['realized_pl'] is None and d['commission'] == 1.0
+        assert d['expiry'] is None and d['strike'] is None
+
+
+class TestStageCloseNeverTransmits:
+    def make_mgr(self, position, log_errors=()):
+        from types import SimpleNamespace as N
+        placed = []
+        contract = N(conId=42, secType='OPT', symbol='AAPL', localSymbol='AAPL 261016P00310000')
+
+        class FakeIB:
+            async def reqPositionsAsync(self):
+                return [N(contract=contract, position=position)]
+
+            def placeOrder(self, c, order):
+                placed.append(order)
+                return N(order=N(orderId=9, permId=1), orderStatus=N(status='Inactive'),
+                         log=[N(errorCode=code, message=msg) for code, msg in log_errors])
+
+        mgr = IBKRManager.__new__(IBKRManager)
+        mgr._ib = FakeIB()
+        mgr._opt_contracts = {42: contract}
+        mgr._opt_tickers = {42: FakeTicker(bid=0.03, ask=0.05, bidSize=1, askSize=1)}
+        mgr._last_snapshot = {'x': 1}
+        return mgr, placed
+
+    def test_short_position_stages_untransmitted_buy_for_full_size(self):
+        mgr, placed = self.make_mgr(-5)
+        result = asyncio.run(mgr._stage_close(42))
+        assert result['ok'] and result['action'] == 'BUY' and result['quantity'] == 5
+        order = placed[0]
+        assert order.transmit is False
+        assert order.action == 'BUY' and order.totalQuantity == 5 and order.lmtPrice == 0.05
+        assert mgr._last_snapshot is None
+
+    def test_long_position_sells(self):
+        mgr, placed = self.make_mgr(3)
+        asyncio.run(mgr._stage_close(42))
+        assert placed[0].action == 'SELL' and placed[0].transmit is False
+
+    def test_unknown_position_places_nothing(self):
+        mgr, placed = self.make_mgr(-5)
+        result = asyncio.run(mgr._stage_close(999))
+        assert not result['ok'] and placed == []
+
+    def test_read_only_api_error_explained(self):
+        mgr, placed = self.make_mgr(-5, log_errors=[(321, 'API interface is currently in Read-Only mode.')])
+        result = asyncio.run(mgr._stage_close(42))
+        assert not result['ok'] and 'Read-Only API' in result['error']

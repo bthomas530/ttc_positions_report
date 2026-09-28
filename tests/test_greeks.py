@@ -30,6 +30,12 @@ class TestBlackScholes:
             price = bs_price(250, 237.5, 30 / 365, 0.35, right)
             assert implied_vol(price, 250, 237.5, 30 / 365, right) == pytest.approx(0.35, abs=1e-3)
 
+    def test_deep_itm_at_intrinsic_is_min_vol(self):
+        from ttc_app.greeks import MIN_VOL
+        T = 9 / 365
+        assert implied_vol(10.30, 430, 420, T, 'C') == MIN_VOL
+        assert bs_greeks(430, 420, T, MIN_VOL, 'C')['delta'] == pytest.approx(1.0, abs=1e-3)
+
     def test_implied_vol_rejects_impossible_price(self):
         # Stale prev close below intrinsic after a big move
         assert implied_vol(1.0, 90, 100, 10 / 365, 'P') is None

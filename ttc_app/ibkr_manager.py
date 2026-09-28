@@ -18,7 +18,9 @@ import time
 
 from datetime import datetime, timedelta
 
-from ib_async import IB, Stock, Contract
+import pytz
+
+from ib_async import IB, Contract, LimitOrder, Stock
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +40,124 @@ BACKOFF_CAP = 60
 CLIENT_ID_RETRIES = 3     # fresh random ids to try on 'client id in use'
 FIRST_PRICE_DEADLINE = 5  # seconds to wait for a new ticker's first price
 SNAPSHOT_MAX_AGE = 5      # seconds a snapshot stays fresh for coalescing
+# Generic tick 456 = IB Dividends (next ex-date + amount) -- rides along on
+# the stock subscriptions we already hold, no extra request or data feed.
+STOCK_GENERIC_TICKS = '456'
+ORDERS_FILLS_TIMEOUT = 5  # seconds; orders/fills are extras, never block prices
+STAGED_ORDER_REF = 'TTC staged close'
+# Order statuses that mean "still working" (anything else is done/dead).
+ACTIVE_ORDER_STATUSES = {'ApiPending', 'PendingSubmit', 'PreSubmitted',
+                         'Submitted', 'PendingCancel', 'Inactive'}
+UNSET_DOUBLE = 1.7976931348623157e+308  # IBKR's "no value" for doubles
+
+
+def order_to_dict(trade):
+    """Flatten an ib_async Trade (open order) for the API."""
+    c, o, st = trade.contract, trade.order, trade.orderStatus
+    lmt = safe_price(o.lmtPrice)
+    return {
+        'order_id': o.orderId,
+        'perm_id': o.permId,
+        'con_id': c.conId,
+        'symbol': c.symbol,
+        'sec_type': c.secType,
+        'right': getattr(c, 'right', '') or '',
+        'strike': safe_price(getattr(c, 'strike', 0)) or None,
+        'expiry': _iso_expiry(getattr(c, 'lastTradeDateOrContractMonth', '')),
+        'action': o.action,
+        'quantity': safe_price(o.totalQuantity),
+        'filled': safe_price(st.filled),
+        'order_type': o.orderType,
+        'limit_price': lmt if 0 < lmt < UNSET_DOUBLE else None,
+        'tif': o.tif,
+        'status': st.status,
+        # False = sitting in TWS waiting for Dad to hit Transmit
+        'transmitted': bool(o.transmit) and st.status != 'Inactive',
+        'staged_by_app': o.orderRef == STAGED_ORDER_REF,
+    }
+
+
+def fill_to_dict(fill):
+    c, e, cr = fill.contract, fill.execution, fill.commissionReport
+    realized = safe_price(getattr(cr, 'realizedPNL', None)) if cr else 0
+    commission = safe_price(getattr(cr, 'commission', None)) if cr else 0
+    return {
+        'exec_id': e.execId,
+        'time': e.time.isoformat() if e.time else None,
+        'symbol': c.symbol,
+        'sec_type': c.secType,
+        'right': getattr(c, 'right', '') or '',
+        'strike': safe_price(getattr(c, 'strike', 0)) or None,
+        'expiry': _iso_expiry(getattr(c, 'lastTradeDateOrContractMonth', '')),
+        'side': 'BUY' if e.side == 'BOT' else 'SELL',
+        'quantity': safe_price(e.shares),
+        'price': safe_price(e.price),
+        # The commission report trails the execution by a moment; until it
+        # lands the field is 0, which would read as "free trade".
+        'commission': commission if 0 < commission < UNSET_DOUBLE else None,
+        'realized_pl': realized if 0 < abs(realized) < UNSET_DOUBLE else None,
+        'order_ref': e.orderRef or '',
+    }
+
+
+def _iso_expiry(raw):
+    if raw and len(raw) >= 8:
+        return f'{raw[:4]}-{raw[4:6]}-{raw[6:8]}'
+    return None
+
+
+def parse_liquid_hours(liquid_hours, tz_name, now):
+    """Is the regular session open at `now`, per IBKR's own calendar?
+
+    liquidHours looks like '20260928:0930-20260928:1600;20260929:CLOSED'
+    in the contract's exchange time zone. Unlike a 9:30-4:00 weekday clock
+    this knows about holidays and half days, so a quiet market on Good
+    Friday isn't mistaken for a frozen data feed. Returns None if the
+    string doesn't cover today (caller falls back to the clock)."""
+    try:
+        tz = pytz.timezone(tz_name or 'US/Eastern')
+    except pytz.UnknownTimeZoneError:
+        tz = pytz.timezone('US/Eastern')
+    local = now.astimezone(tz)
+    today = local.strftime('%Y%m%d')
+    covered = False
+    for part in (liquid_hours or '').split(';'):
+        part = part.strip()
+        if not part:
+            continue
+        if part.endswith(':CLOSED'):
+            if part.startswith(today):
+                covered = True
+            continue
+        try:
+            start_s, end_s = part.split('-')
+            start = tz.localize(datetime.strptime(start_s, '%Y%m%d:%H%M'))
+            end = tz.localize(datetime.strptime(end_s, '%Y%m%d:%H%M'))
+        except ValueError:
+            continue
+        if start_s.startswith(today):
+            covered = True
+        if start <= local < end:
+            return True
+    return False if covered else None
+
+
+def staged_close_price(right_side, bid, ask, mark):
+    """Starting limit price for a staged closing order -- Dad edits it in
+    TWS before transmitting anyway, so this just needs to be sensible and a
+    valid increment: buying to close starts at the ask (else the mark),
+    selling at the bid; rounded away from the market to $0.01 under $3 and
+    $0.05 above, which every US option class accepts."""
+    if right_side == 'BUY':
+        price = ask if ask > 0 else mark
+    else:
+        price = bid if bid > 0 else mark
+    if not price or price <= 0:
+        return 0.01 if right_side == 'BUY' else None
+    tick = 0.01 if price < 3 else 0.05
+    steps = price / tick
+    steps = math.ceil(steps - 1e-9) if right_side == 'BUY' else math.floor(steps + 1e-9)
+    return max(0.01, round(steps * tick, 2))
 
 
 ACCOUNT_TAGS = {
@@ -440,7 +560,8 @@ class IBKRManager:
         self._tickers.clear()
         for symbol in symbols:
             try:
-                self._tickers[symbol] = self._ib.reqMktData(self._contracts[symbol])
+                self._tickers[symbol] = self._ib.reqMktData(
+                    self._contracts[symbol], STOCK_GENERIC_TICKS)
             except Exception as e:
                 logger.warning(f'Could not resubscribe {symbol}: {e}')
         conids = list(self._opt_contracts.keys())
@@ -538,7 +659,11 @@ class IBKRManager:
                 if last <= 0:
                     last = safe_price(ticker.last) or safe_price(ticker.close)
                 close = safe_price(ticker.close)
+                div = ticker.dividends
                 market_data[symbol] = {
+                    'dividend': ({'next_date': div.nextDate.isoformat() if div.nextDate else None,
+                                  'next_amount': div.nextAmount}
+                                 if div and div.nextDate else None),
                     'last': last,
                     'open': safe_price(ticker.open),
                     'close': close,
@@ -549,16 +674,134 @@ class IBKRManager:
                     'timestamp': now_str,
                 }
 
+            tick_times = [t.time for t in self._tickers.values() if t.time]
             snapshot = {
                 'positions_raw': positions_raw,
                 'market_data': market_data,
                 'failed_symbols': failed_symbols,
                 'options': options,
                 'account': account_summary(self._ib.accountValues()),
+                'open_orders': await self._fetch_open_orders(),
+                'fills_today': await self._fetch_fills_today(),
+                'market_session': await self._market_session(),
+                # Newest price tick across all stock subscriptions: if this
+                # stops moving during market hours, prices on screen are
+                # frozen even though the socket still says "connected"
+                # (e.g. Warning 2103, market data farm connection broken).
+                'last_tick': max(tick_times).isoformat() if tick_times else None,
             }
             self._last_snapshot = snapshot
             self._last_snapshot_time = time.time()
             return snapshot
+
+    async def _fetch_open_orders(self):
+        """All working orders on the account -- including ones Dad typed into
+        TWS by hand (reqAllOpenOrders, not just this API client's)."""
+        try:
+            trades = await asyncio.wait_for(
+                self._ib.reqAllOpenOrdersAsync(), ORDERS_FILLS_TIMEOUT)
+        except Exception as e:
+            logger.warning(f'Could not fetch open orders: {e}')
+            return None
+        return [order_to_dict(t) for t in trades
+                if t.orderStatus.status in ACTIVE_ORDER_STATUSES]
+
+    async def _fetch_fills_today(self):
+        """Today's executions straight from TWS, so trades show up now rather
+        than after the next day's Flex import."""
+        try:
+            fills = await asyncio.wait_for(
+                self._ib.reqExecutionsAsync(), ORDERS_FILLS_TIMEOUT)
+        except Exception as e:
+            logger.warning(f'Could not fetch executions: {e}')
+            return None
+        eastern = pytz.timezone('US/Eastern')
+        today = datetime.now(eastern).date()
+        rows = []
+        for f in fills:
+            t = f.execution.time
+            if t and t.astimezone(eastern).date() != today:
+                continue
+            rows.append(fill_to_dict(f))
+        rows.sort(key=lambda r: r['time'] or '', reverse=True)
+        return rows
+
+    async def _market_session(self):
+        """{'open': bool|None, 'source': 'ibkr'} from SPY's liquidHours,
+        fetched once per day."""
+        eastern = pytz.timezone('US/Eastern')
+        today = datetime.now(eastern).date()
+        cached = getattr(self, '_session_cache', None)
+        if not cached or cached[0] != today:
+            try:
+                details = await asyncio.wait_for(
+                    self._ib.reqContractDetailsAsync(Stock('SPY', 'SMART', 'USD')),
+                    ORDERS_FILLS_TIMEOUT)
+                d = details[0] if details else None
+                cached = (today, d.liquidHours if d else '', d.timeZoneId if d else '')
+            except Exception as e:
+                logger.warning(f'Could not fetch trading hours: {e}')
+                cached = (today, '', '')
+            self._session_cache = cached
+        is_open = parse_liquid_hours(cached[1], cached[2], datetime.now(pytz.utc))
+        return {'open': is_open, 'source': 'ibkr' if is_open is not None else None}
+
+    # ---------- staged orders ----------
+
+    def stage_close_order(self, conid, timeout=10):
+        """Put an UNTRANSMITTED limit order closing the whole option position
+        `conid` into TWS. It shows up in TWS's Orders panel with a Transmit
+        button; nothing reaches the exchange until Dad clicks it there.
+        Quantity and side come from the live position, never from the caller,
+        so this can only ever close what's actually held."""
+        if not self.is_connected():
+            raise NotConnectedError('Not connected to IBKR.')
+        future = asyncio.run_coroutine_threadsafe(self._stage_close(conid), self._loop)
+        return future.result(timeout)
+
+    async def _stage_close(self, conid):
+        positions = await self._ib.reqPositionsAsync()
+        held = next((p for p in positions
+                     if p.contract.conId == conid and p.contract.secType == 'OPT'
+                     and p.position), None)
+        if held is None:
+            return {'ok': False, 'error': 'That option position is no longer open.'}
+        contract = self._opt_contracts.get(conid)
+        if contract is None:
+            contract = Contract(conId=conid, exchange='SMART')
+            await self._ib.qualifyContractsAsync(contract)
+        ticker = self._opt_tickers.get(conid)
+        action = 'BUY' if held.position < 0 else 'SELL'
+        mark, _ = option_mark(ticker) if ticker else (None, None)
+        price = staged_close_price(
+            action,
+            safe_price(ticker.bid) if ticker else 0,
+            safe_price(ticker.ask) if ticker else 0,
+            mark or 0)
+        if price is None:
+            return {'ok': False, 'error': 'No price to start the order from.'}
+        order = LimitOrder(action, abs(held.position), price,
+                           transmit=False, tif='DAY', orderRef=STAGED_ORDER_REF)
+        trade = self._ib.placeOrder(contract, order)
+        # TWS answers an untransmitted order with openOrder (success) or an
+        # error (e.g. 321 read-only API). Give it a moment to do either.
+        for _ in range(20):
+            await asyncio.sleep(0.1)
+            errors = [e for e in trade.log if e.errorCode]
+            if errors:
+                code, msg = errors[-1].errorCode, errors[-1].message
+                if code == 321 or 'read-only' in (msg or '').lower():
+                    msg = ('TWS is in Read-Only API mode. In TWS: File > Global '
+                           'Configuration > API > Settings, uncheck "Read-Only API".')
+                return {'ok': False, 'error': msg, 'code': code}
+            if trade.orderStatus.status or trade.order.permId:
+                break
+        self._last_snapshot = None  # next refresh should show the new order
+        return {
+            'ok': True, 'order_id': trade.order.orderId, 'action': action,
+            'quantity': abs(held.position), 'limit_price': price,
+            'description': f'{action} {abs(held.position):g} {contract.localSymbol or contract.symbol} @ {price:.2f} LMT',
+        }
 
     async def _ensure_option_subscriptions(self, option_positions):
         """Maintain standing subscriptions for option positions (by conId) and
@@ -697,7 +940,7 @@ class IBKRManager:
             if contract is None:
                 continue
             try:
-                ticker = self._ib.reqMktData(contract)
+                ticker = self._ib.reqMktData(contract, STOCK_GENERIC_TICKS)
                 self._tickers[symbol] = ticker
                 new_tickers.append(ticker)
             except Exception as e:
