@@ -167,3 +167,20 @@ class TestExport:
         assert any('trades' in p and p.endswith('.csv') for p in written)
         for p in written:
             assert os.path.exists(p)
+
+
+class TestOptionSnapshotLookups:
+    def test_latest_iv_skips_missing_and_first_seen(self, tmp_path):
+        db = make_db(tmp_path)
+        base = datetime(2026, 9, 1, 10, 0)
+        snap = {'conId': 7, 'symbol': 'AAPL', 'right': 'P', 'strike': 300,
+                'expiry': '2026-10-16', 'position': -1, 'mark': 1.0, 'entry_price': 2.0}
+        db.record_option_snapshots([{**snap, 'iv': 0.30}], now=base)
+        db.record_option_snapshots([{**snap, 'iv': 0.25}], now=base + timedelta(hours=1))
+        db.record_option_snapshots([{**snap, 'iv': None}], now=base + timedelta(hours=2))
+        assert db.latest_option_ivs([7, 8]) == {7: 0.25}
+        # Conid 7 is the oldest thing in the DB: can't tell when it opened
+        assert db.option_first_seen([7]) == {}
+        later = base + timedelta(days=3)
+        db.record_option_snapshots([{**snap, 'conId': 8, 'iv': 0.2}], now=later)
+        assert db.option_first_seen([7, 8]) == {8: later.isoformat()}

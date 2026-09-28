@@ -13,7 +13,7 @@ import secrets
 import threading
 import time
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytz
@@ -25,11 +25,16 @@ from ttc_app.config import (
 )
 from ttc_app.ibkr_manager import IBKRUnavailableError, probe_ib_ports
 from ttc_app.price_sources import fetch_cboe_prices, fetch_yahoo_prices, is_cusip
-from ttc_app.tranches import income_summary, rebuild_tranches
+from ttc_app.greeks import bs_greeks, implied_vol, years_to_expiry
+from ttc_app.tranches import income_summary, option_open_dates, rebuild_tranches
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_BUYBACK_THRESHOLD_PCT = 15.0
+# A short option within this % of its strike, this many days or fewer from
+# expiry, gets an assignment-risk warning (ITM always does, inside the window).
+DEFAULT_ASSIGNMENT_WARN_PCT = 2.0
+DEFAULT_ASSIGNMENT_WARN_DTE = 7
 
 # Shared runtime state, populated by main.py
 state = SimpleNamespace(
@@ -153,6 +158,17 @@ def buyback_threshold_pct():
         'buyback_threshold_pct', DEFAULT_BUYBACK_THRESHOLD_PCT)) or DEFAULT_BUYBACK_THRESHOLD_PCT
 
 
+def assignment_warn_pct():
+    # 0 is meaningful here ("only warn once actually ITM"), so no `or default`
+    value = state.db.get_setting('assignment_warn_pct', None)
+    return DEFAULT_ASSIGNMENT_WARN_PCT if value is None else max(0.0, safe_number(value))
+
+
+def assignment_warn_dte():
+    value = state.db.get_setting('assignment_warn_dte', None)
+    return DEFAULT_ASSIGNMENT_WARN_DTE if value is None else max(0, int(safe_number(value)))
+
+
 # ============================================
 # Price fallbacks (Yahoo -> Cboe -> DB history)
 # ============================================
@@ -274,6 +290,7 @@ def get_ibkr_data():
         'data_sources': data_sources,
         'connection_source': 'ibkr',
         'options': options,
+        'account': snapshot.get('account') or {},
     }
 
     # Symbols with options but no stock (cash-secured short puts, e.g.) must
@@ -327,6 +344,252 @@ def get_ibkr_data():
             })
 
     return basic_data
+
+
+# ============================================
+# Option rows: marks, greeks, yields, risk flags
+# ============================================
+def _safe_lookup(label, fn, default):
+    """DB-backed extras must never take down the Positions tab."""
+    try:
+        return fn()
+    except Exception as e:
+        logger.warning(f'Option {label} lookup failed: {e}')
+        return default
+
+
+def option_context(options, stock_positions):
+    """Everything build_option_row needs beyond the option itself, fetched
+    once per refresh rather than once per contract."""
+    conids = [o.get('conId') for o in options if o.get('conId')]
+    open_dates = _safe_lookup(
+        'open-date', lambda: option_open_dates(state.db.get_trades()), {})
+    covered_lots = {}
+    for t in _safe_lookup(
+            'tranche', lambda: state.db.get_tranches(include_closed=False), []):
+        call = t.get('covering_call')
+        if call:
+            covered_lots.setdefault(
+                (t['symbol'], call.get('strike'), call.get('expiry')), []).append(t)
+    return {
+        'threshold': buyback_threshold_pct(),
+        'warn_pct': assignment_warn_pct(),
+        'warn_dte': assignment_warn_dte(),
+        'ivs': _safe_lookup('IV', lambda: state.db.latest_option_ivs(conids), {}),
+        'first_seen': _safe_lookup(
+            'first-seen', lambda: state.db.option_first_seen(conids), {}),
+        'open_dates': open_dates,
+        'covered_lots': covered_lots,
+        'avg_costs': {p['symbol']: safe_number(p.get('avgCost'))
+                      for p in stock_positions if safe_number(p.get('shares')) > 0},
+    }
+
+
+def covered_call_basis_flag(strike, lots, avg_cost):
+    """Would assignment at `strike` sell shares below what they cost?
+
+    Uses the actual lots the call covers (Tranches) when known: 'loss' if the
+    strike is under the worst lot's basis net of all premium collected on it
+    (a real loss), 'stock_loss' if it's only under the purchase price
+    (premium makes up the gap). Without tranche data, falls back to IBKR's
+    blended average cost ('below_avg'). Returns (flag, reference_price)."""
+    if not strike:
+        return None, None
+    if lots:
+        worst_net = max((t.get('open_price') or 0) - (t.get('premium') or 0) / (t.get('qty') or 1)
+                        for t in lots)
+        worst_open = max(t.get('open_price') or 0 for t in lots)
+        if strike < worst_net:
+            return 'loss', round(worst_net, 2)
+        if strike < worst_open:
+            return 'stock_loss', round(worst_open, 2)
+        return None, None
+    if avg_cost and strike < avg_cost:
+        return 'below_avg', round(avg_cost, 2)
+    return None, None
+
+
+def _days_between(start_iso, end_iso):
+    try:
+        start = datetime.fromisoformat(start_iso[:19]).date()
+        end = datetime.strptime(end_iso[:10], '%Y-%m-%d').date()
+        return (end - start).days
+    except (TypeError, ValueError):
+        return None
+
+
+def build_option_row(opt, und_price, ctx):
+    symbol = opt.get('symbol')
+    right = opt.get('right')
+    conid = opt.get('conId')
+    entry = safe_number(opt.get('entry_price'))
+    # None = no quote at all. Must stay distinct from a real $0.00 mark:
+    # coercing it to 0 read as "0% premium left" and fired a bogus
+    # BUYBACK on one expiring put while its siblings stayed silent.
+    raw_mark = opt.get('mark')
+    mark = safe_number(raw_mark) if raw_mark is not None else None
+    position = opt.get('position') or 0
+    short = position < 0
+    multiplier = safe_number(opt.get('multiplier')) or 100
+    strike = safe_number(opt.get('strike'))
+    expiry = opt.get('expiry')
+    dte = opt.get('dte')
+    # Expiring today (or past expiry but not yet cleared by IBKR).
+    expiring = dte is not None and dte <= 0
+
+    premium_remaining_pct = None
+    if entry > 0 and mark is not None:
+        premium_remaining_pct = round(100 * mark / entry, 1)
+
+    itm = None
+    cushion_pct = None
+    if und_price > 0 and strike > 0:
+        if right == 'P':
+            itm = und_price < strike
+            cushion_pct = round(100 * (und_price - strike) / und_price, 2)
+        elif right == 'C':
+            itm = und_price > strike
+            cushion_pct = round(100 * (strike - und_price) / und_price, 2)
+
+    # Greeks: IBKR's model first; otherwise Black-Scholes from the best vol
+    # available (see greeks.py for why this is needed pre-market).
+    delta, theta, iv = opt.get('delta'), opt.get('theta'), opt.get('iv')
+    greeks_source = 'ibkr' if delta is not None else None
+    iv_source = 'ibkr' if iv else None
+    if delta is None and und_price > 0 and strike > 0:
+        T = years_to_expiry(expiry)
+        sigma = iv or None
+        if not sigma and mark and opt.get('mark_source') == 'live' and T:
+            sigma, iv_source = implied_vol(mark, und_price, strike, T, right), 'implied'
+        if not sigma and ctx['ivs'].get(conid):
+            sigma, iv_source = ctx['ivs'][conid], 'last_known'
+        if not sigma and mark and T:
+            sigma, iv_source = implied_vol(mark, und_price, strike, T, right), 'implied'
+        if not sigma:
+            iv_source = None
+        if T is not None and (sigma or T == 0):
+            g = bs_greeks(und_price, strike, T, sigma, right)
+            if g:
+                delta, theta = g['delta'], g['theta']
+                iv = sigma
+                greeks_source = 'calc'
+
+    unrealized_pl = None
+    if mark is not None and entry > 0:
+        unrealized_pl = round((mark - entry) * position * multiplier, 2)
+
+    # Open date: from trade history, else when this app first saw it.
+    open_ts = ctx['open_dates'].get((symbol, right, opt.get('strike'), expiry))
+    open_source = 'trades' if open_ts else None
+    if not open_ts and ctx['first_seen'].get(conid):
+        open_ts, open_source = ctx['first_seen'][conid], 'first_seen'
+
+    yield_ann = None
+    yield_left_ann = None
+    if short and strike > 0:
+        total_days = _days_between(open_ts, expiry) if open_ts else None
+        if entry > 0 and total_days is not None:
+            yield_ann = round(100 * entry / strike * 365 / max(total_days, 1), 1)
+        if mark is not None and dte is not None:
+            yield_left_ann = round(100 * mark / strike * 365 / max(dte, 1), 1)
+
+    assignment_risk = None
+    if short and itm is not None and dte is not None and dte <= ctx['warn_dte']:
+        if itm:
+            assignment_risk = 'itm'
+        elif cushion_pct is not None and cushion_pct <= ctx['warn_pct']:
+            assignment_risk = 'near'
+
+    basis_flag, basis_ref = None, None
+    if short and right == 'C':
+        basis_flag, basis_ref = covered_call_basis_flag(
+            strike, ctx['covered_lots'].get((symbol, opt.get('strike'), expiry)),
+            ctx['avg_costs'].get(symbol))
+
+    return {
+        'conId': conid,
+        'localSymbol': opt.get('localSymbol'),
+        'right': right,
+        'strike': opt.get('strike'),
+        'expiry': expiry,
+        'dte': dte,
+        'position': opt.get('position'),
+        'multiplier': multiplier,
+        'entry_price': round(entry, 4),
+        'mark': round(mark, 4) if mark is not None else None,
+        'mark_source': opt.get('mark_source'),
+        'premium_remaining_pct': premium_remaining_pct,
+        'unrealized_pl': unrealized_pl,
+        # Not on expiry day: the buyback threshold is the "lock in the
+        # profit early and redeploy" signal. On expiry day the question
+        # is only ITM vs OTM, which `expiring` + `itm` answer for every
+        # short contract consistently.
+        'buyback_target_hit': bool(
+            short
+            and not expiring
+            and premium_remaining_pct is not None
+            and premium_remaining_pct <= ctx['threshold']),
+        'expiring': bool(expiring and position != 0),
+        'itm': itm,
+        'cushion_pct': cushion_pct,
+        'und_price': und_price or None,
+        'assignment_risk': assignment_risk,
+        'basis_flag': basis_flag,
+        'basis_ref': basis_ref,
+        'open_date': open_ts[:10] if open_ts else None,
+        'open_date_source': open_source,
+        'yield_ann': yield_ann,
+        'yield_left_ann': yield_left_ann,
+        'delta': round(delta, 4) if delta is not None else None,
+        'theta': round(theta, 4) if theta is not None else None,
+        'iv': round(iv, 4) if iv else None,
+        'greeks_source': greeks_source,
+        'iv_source': iv_source,
+    }
+
+
+def _days_to_friday(today):
+    """Calendar days from `today` to this week's Friday (next week's on a
+    weekend) -- the "expiring this week" window."""
+    weekday = today.weekday()  # Mon=0
+    return 4 - weekday if weekday <= 4 else 11 - weekday
+
+
+def portfolio_summary(options_by_symbol, account, has_options_data=True, today=None):
+    today = today or datetime.now(pytz.timezone('America/New_York')).date()
+    window = _days_to_friday(today)
+    put_exposure = 0.0
+    week = {'contracts': 0, 'itm': 0, 'at_risk': 0, 'items': []}
+    for symbol, rows in options_by_symbol.items():
+        for r in rows:
+            pos = r.get('position') or 0
+            if pos >= 0:
+                continue
+            if r.get('right') == 'P':
+                put_exposure += abs(pos) * (r.get('strike') or 0) * (r.get('multiplier') or 100)
+            dte = r.get('dte')
+            if dte is not None and dte <= window:
+                week['contracts'] += abs(pos)
+                week['itm'] += abs(pos) if r.get('itm') else 0
+                week['at_risk'] += abs(pos) if r.get('assignment_risk') else 0
+                week['items'].append({
+                    'symbol': symbol, 'right': r.get('right'), 'strike': r.get('strike'),
+                    'expiry': r.get('expiry'), 'dte': dte, 'position': pos,
+                    'itm': r.get('itm'), 'cushion_pct': r.get('cushion_pct'),
+                })
+    week['items'].sort(key=lambda i: (i['dte'], i['symbol']))
+    cash = account.get('cash')
+    return {
+        'has_options_data': has_options_data,
+        'put_exposure': round(put_exposure, 2),
+        'cash': cash,
+        'available_funds': account.get('available_funds'),
+        'net_liquidation': account.get('net_liquidation'),
+        'put_exposure_pct_of_cash': (round(100 * put_exposure / cash, 1)
+                                     if cash and cash > 0 else None),
+        'expiring_week': week,
+        'expiring_week_through': (today + timedelta(days=window)).isoformat(),
+    }
 
 
 def enhance_with_market_data(basic_data):
@@ -415,64 +678,15 @@ def enhance_with_market_data(basic_data):
         ])
 
     # Options grouped by underlying, with premium-remaining for shorts
-    threshold = buyback_threshold_pct()
+    options = basic_data.get('options', [])
+    ctx = option_context(options, basic_data.get('positions', []))
     options_by_symbol = {}
-    for opt in basic_data.get('options', []):
+    for opt in options:
         symbol = opt.get('symbol')
-        entry = safe_number(opt.get('entry_price'))
-        # None = no quote at all. Must stay distinct from a real $0.00 mark:
-        # coercing it to 0 read as "0% premium left" and fired a bogus
-        # BUYBACK on one expiring put while its siblings stayed silent.
-        raw_mark = opt.get('mark')
-        mark = safe_number(raw_mark) if raw_mark is not None else None
-        premium_remaining_pct = None
-        if entry > 0 and mark is not None:
-            premium_remaining_pct = round(100 * mark / entry, 1)
-        position = opt.get('position') or 0
-        dte = opt.get('dte')
-        # Expiring today (or past expiry but not yet cleared by IBKR).
-        expiring = dte is not None and dte <= 0
-        strike = safe_number(opt.get('strike'))
         und_price = (safe_number(market_data.get(symbol, {}).get('last'))
                      or safe_number(opt.get('und_price')))
-        itm = None
-        cushion_pct = None
-        if und_price > 0 and strike > 0:
-            if opt.get('right') == 'P':
-                itm = und_price < strike
-                cushion_pct = round(100 * (und_price - strike) / und_price, 2)
-            elif opt.get('right') == 'C':
-                itm = und_price > strike
-                cushion_pct = round(100 * (strike - und_price) / und_price, 2)
-        row = {
-            'localSymbol': opt.get('localSymbol'),
-            'right': opt.get('right'),
-            'strike': opt.get('strike'),
-            'expiry': opt.get('expiry'),
-            'dte': dte,
-            'position': opt.get('position'),
-            'entry_price': round(entry, 4),
-            'mark': round(mark, 4) if mark is not None else None,
-            'mark_source': opt.get('mark_source'),
-            'premium_remaining_pct': premium_remaining_pct,
-            # Not on expiry day: the buyback threshold is the "lock in the
-            # profit early and redeploy" signal. On expiry day the question
-            # is only ITM vs OTM, which `expiring` + `itm` answer for every
-            # short contract consistently.
-            'buyback_target_hit': bool(
-                position < 0
-                and not expiring
-                and premium_remaining_pct is not None
-                and premium_remaining_pct <= threshold),
-            'expiring': bool(expiring and position != 0),
-            'itm': itm,
-            'cushion_pct': cushion_pct,
-            'und_price': und_price or None,
-            'delta': opt.get('delta'),
-            'theta': opt.get('theta'),
-            'iv': opt.get('iv'),
-        }
-        options_by_symbol.setdefault(symbol, []).append(row)
+        options_by_symbol.setdefault(symbol, []).append(
+            build_option_row(opt, und_price, ctx))
     for rows in options_by_symbol.values():
         rows.sort(key=lambda r: (r.get('expiry') or '', r.get('strike') or 0))
 
@@ -482,7 +696,12 @@ def enhance_with_market_data(basic_data):
         'watchlist': enhanced_watchlist,
         'connection_source': connection_source,
         'options_by_symbol': options_by_symbol,
-        'buyback_threshold_pct': threshold,
+        'buyback_threshold_pct': ctx['threshold'],
+        'assignment_warn_pct': ctx['warn_pct'],
+        'assignment_warn_dte': ctx['warn_dte'],
+        'portfolio': portfolio_summary(
+            options_by_symbol, basic_data.get('account') or {},
+            has_options_data=connection_source == 'ibkr'),
     }
 
 
@@ -767,6 +986,9 @@ def api_tranches():
                 qty = t['qty'] or 1
                 row['net_basis'] = round((t['open_price'] or 0) - (t['premium'] / qty), 4)
                 row['sell_would_uncover'] = t.get('covering_call') is not None
+                call = t.get('covering_call') or {}
+                row['call_basis_flag'], row['call_basis_ref'] = covered_call_basis_flag(
+                    safe_number(call.get('strike')), [t], None) if call else (None, None)
 
                 # Holding period, for the long/short-term capital-gains badge.
                 # SEEDED tranches predate the imported trade history, so their
@@ -865,6 +1087,8 @@ def api_get_settings():
         'flex_token_masked': (token[:4] + '...' + token[-4:]) if len(token) > 8 else ('set' if token else ''),
         'flex_token_set': bool(token),
         'buyback_threshold_pct': buyback_threshold_pct(),
+        'assignment_warn_pct': assignment_warn_pct(),
+        'assignment_warn_dte': assignment_warn_dte(),
         'weekly_premium_goal': safe_number(state.db.get_setting('weekly_premium_goal', 0)),
         'monthly_premium_goal': safe_number(state.db.get_setting('monthly_premium_goal', 0)),
         'data_dir': os.path.dirname(state.db.path),
@@ -884,6 +1108,12 @@ def api_post_settings():
     if 'buyback_threshold_pct' in payload:
         state.db.set_setting('buyback_threshold_pct',
                              safe_number(payload['buyback_threshold_pct']) or DEFAULT_BUYBACK_THRESHOLD_PCT)
+    if 'assignment_warn_pct' in payload:
+        state.db.set_setting('assignment_warn_pct',
+                             max(0.0, safe_number(payload['assignment_warn_pct'])))
+    if 'assignment_warn_dte' in payload:
+        state.db.set_setting('assignment_warn_dte',
+                             max(0, int(safe_number(payload['assignment_warn_dte']))))
     if 'weekly_premium_goal' in payload:
         state.db.set_setting('weekly_premium_goal',
                              safe_number(payload['weekly_premium_goal']))

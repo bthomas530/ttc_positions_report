@@ -1,6 +1,8 @@
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ttc_app import web
@@ -27,6 +29,24 @@ class FakeDB:
 
     def latest_prices(self):
         return {}
+
+    # Option-row extras (see web.option_context)
+    trades = ()
+    tranches = ()
+    ivs = {}
+    first_seen = {}
+
+    def get_trades(self, symbol=None):
+        return list(self.trades)
+
+    def get_tranches(self, include_closed=True):
+        return list(self.tranches)
+
+    def latest_option_ivs(self, conids):
+        return {c: v for c, v in self.ivs.items() if c in conids}
+
+    def option_first_seen(self, conids):
+        return {c: v for c, v in self.first_seen.items() if c in conids}
 
 
 class FakeIBKR:
@@ -151,19 +171,29 @@ class TestGetIbkrData:
         assert 'NVDA' not in data['watchlist']
 
 
-def enhance_options(options, market_data=None, threshold=None):
+def enhance(options, market_data=None, settings=None, positions=None,
+            account=None, **db_attrs):
     web.state.db = FakeDB()
-    web.state.db.get_setting = lambda key, default=None: (
-        threshold if threshold is not None else default)
+    for k, v in db_attrs.items():
+        setattr(web.state.db, k, v)
+    settings = settings or {}
+    web.state.db.get_setting = lambda key, default=None: settings.get(key, default)
     return web.enhance_with_market_data({
-        'positions': [], 'incomplete_lots': [], 'watchlist': [],
+        'positions': positions or [], 'incomplete_lots': [], 'watchlist': [],
         'market_data': market_data or {}, 'options': options,
-    })['options_by_symbol']
+        'account': account or {},
+    })
+
+
+def enhance_options(options, market_data=None, **kw):
+    return enhance(options, market_data, **kw)['options_by_symbol']
 
 
 def short_put(symbol, strike, dte, entry, mark, mark_source='live'):
+    from datetime import date, timedelta
     return {'symbol': symbol, 'right': 'P', 'strike': strike, 'dte': dte,
-            'expiry': '2026-09-23', 'position': -5, 'entry_price': entry,
+            'expiry': (date.today() + timedelta(days=dte)).isoformat(),
+            'position': -5, 'entry_price': entry,
             'mark': mark, 'mark_source': mark_source}
 
 
@@ -211,3 +241,152 @@ class TestOptionAlerts:
     def test_moneyness_unknown_without_price(self):
         row = enhance_options([short_put('XYZ', 50, 0, 1.0, 0.5)])['XYZ'][0]
         assert row['itm'] is None
+
+
+class TestGreeksFallback:
+    def test_ibkr_greeks_pass_through(self):
+        opt = dict(short_put('AAPL', 310, 10, 2.0, 1.0), delta=-0.2, theta=-0.05, iv=0.3)
+        row = enhance_options([opt], {'AAPL': {'last': 320}})['AAPL'][0]
+        assert row['delta'] == -0.2 and row['greeks_source'] == 'ibkr'
+
+    def test_premarket_uses_last_known_iv(self):
+        # No IBKR greeks and a stale prev-close mark: prefer IBKR's last IV
+        opt = dict(short_put('AAPL', 310, 10, 2.0, 1.0, 'prev_close'), conId=42)
+        row = enhance_options([opt], {'AAPL': {'last': 320}}, ivs={42: 0.3})['AAPL'][0]
+        assert row['greeks_source'] == 'calc' and row['iv_source'] == 'last_known'
+        assert row['iv'] == 0.3
+        assert -0.5 < row['delta'] < 0
+        assert row['theta'] < 0
+
+    def test_live_mark_implies_vol(self):
+        opt = dict(short_put('AAPL', 310, 10, 2.0, 1.5, 'live'), conId=42)
+        row = enhance_options([opt], {'AAPL': {'last': 320}}, ivs={42: 0.9})['AAPL'][0]
+        assert row['iv_source'] == 'implied'
+        assert row['iv'] != 0.9
+
+    def test_no_vol_leaves_blank(self):
+        opt = dict(short_put('AAPL', 310, 10, 2.0, None, None), conId=42)
+        row = enhance_options([opt], {'AAPL': {'last': 320}})['AAPL'][0]
+        assert row['delta'] is None and row['greeks_source'] is None
+
+
+class TestPnlAndYield:
+    def test_unrealized_pl_dollars(self):
+        call = dict(short_put('AAPL', 350, 450, 5.35, 45.74), right='C', position=-30)
+        row = enhance_options([call])['AAPL'][0]
+        assert row['unrealized_pl'] == pytest.approx(-121170.0)
+        put = enhance_options([short_put('AAPL', 310, 10, 2.0, 0.5)])['AAPL'][0]
+        assert put['unrealized_pl'] == pytest.approx(750.0)
+
+    def test_yield_from_trade_history(self):
+        opt = short_put('AAPL', 100, 20, 1.0, 0.5)
+        opt['expiry'] = '2026-10-16'
+        trades = [{'sec_type': 'OPT', 'symbol': 'AAPL', 'put_call': 'P', 'strike': 100,
+                   'expiry': '2026-10-16', 'quantity': -5, 'trade_ts': '2026-09-16T10:00:00'}]
+        row = enhance_options([opt], trades=trades)['AAPL'][0]
+        assert row['open_date'] == '2026-09-16' and row['open_date_source'] == 'trades'
+        assert row['yield_ann'] == pytest.approx(round(100 * 1.0 / 100 * 365 / 30, 1))
+        assert row['yield_left_ann'] == pytest.approx(round(100 * 0.5 / 100 * 365 / 20, 1))
+
+    def test_yield_falls_back_to_first_seen(self):
+        opt = dict(short_put('AAPL', 100, 20, 1.0, 0.5), conId=9)
+        opt['expiry'] = '2026-10-16'
+        row = enhance_options([opt], first_seen={9: '2026-10-06T09:00:00'})['AAPL'][0]
+        assert row['open_date_source'] == 'first_seen'
+        assert row['yield_ann'] == pytest.approx(36.5)
+
+    def test_no_yield_for_longs(self):
+        opt = dict(short_put('AAPL', 100, 20, 1.0, 0.5), position=5)
+        row = enhance_options([opt])['AAPL'][0]
+        assert row['yield_ann'] is None and row['yield_left_ann'] is None
+
+
+class TestAssignmentRisk:
+    def test_near_and_itm_inside_window(self):
+        rows = enhance_options(
+            [short_put('AAA', 100, 5, 1.0, 0.5), short_put('BBB', 100, 5, 1.0, 0.5),
+             short_put('CCC', 100, 5, 1.0, 0.5), short_put('DDD', 100, 30, 1.0, 0.5)],
+            {'AAA': {'last': 101}, 'BBB': {'last': 99}, 'CCC': {'last': 120},
+             'DDD': {'last': 99}})
+        assert rows['AAA'][0]['assignment_risk'] == 'near'
+        assert rows['BBB'][0]['assignment_risk'] == 'itm'
+        assert rows['CCC'][0]['assignment_risk'] is None
+        assert rows['DDD'][0]['assignment_risk'] is None   # outside 7d window
+
+    def test_settings_respected_including_zero(self):
+        rows = enhance_options([short_put('AAA', 100, 20, 1.0, 0.5)], {'AAA': {'last': 101}},
+                               settings={'assignment_warn_pct': 0, 'assignment_warn_dte': 30})
+        assert rows['AAA'][0]['assignment_risk'] is None
+        rows = enhance_options([short_put('AAA', 100, 20, 1.0, 0.5)], {'AAA': {'last': 101}},
+                               settings={'assignment_warn_pct': 2, 'assignment_warn_dte': 30})
+        assert rows['AAA'][0]['assignment_risk'] == 'near'
+
+
+class TestCoveredCallBasis:
+    def lot(self, open_price, premium, qty=100):
+        return {'open_price': open_price, 'premium': premium, 'qty': qty}
+
+    def test_flags(self):
+        f = web.covered_call_basis_flag
+        assert f(95, [self.lot(100, 200)], None) == ('loss', 98.0)
+        assert f(99, [self.lot(100, 200)], None) == ('stock_loss', 100.0)
+        assert f(101, [self.lot(100, 200)], None) == (None, None)
+        # worst lot drives it
+        assert f(99, [self.lot(90, 0), self.lot(100, 0)], None) == ('loss', 100.0)
+        # no tranche data -> IBKR average cost
+        assert f(90, None, 95.0) == ('below_avg', 95.0)
+        assert f(100, None, 95.0) == (None, None)
+
+    def test_wired_into_call_rows(self):
+        call = dict(short_put('AAPL', 95, 30, 1.0, 0.5), right='C', expiry='2026-10-16')
+        lots = [{'symbol': 'AAPL', 'open_price': 100, 'premium': 200, 'qty': 100,
+                 'covering_call': {'strike': 95, 'expiry': '2026-10-16'}}]
+        row = enhance_options([call], tranches=lots)['AAPL'][0]
+        assert row['basis_flag'] == 'loss' and row['basis_ref'] == 98.0
+        row = enhance_options([call], positions=[{'symbol': 'AAPL', 'shares': 100, 'avgCost': 97, 'naked_puts': 0, 'covered_calls': 1, 'uncovered_calls': 0}])['AAPL'][0]
+        assert row['basis_flag'] == 'below_avg'
+
+
+class TestPortfolioSummary:
+    def test_days_to_friday(self):
+        from datetime import date
+        assert web._days_to_friday(date(2026, 9, 28)) == 4   # Mon
+        assert web._days_to_friday(date(2026, 10, 2)) == 0   # Fri
+        assert web._days_to_friday(date(2026, 10, 3)) == 6   # Sat -> next Fri
+
+    def test_exposure_and_week(self):
+        from datetime import date
+        data = enhance(
+            [short_put('AAA', 100, 2, 1.0, 0.5), short_put('BBB', 50, 30, 1.0, 0.5),
+             dict(short_put('CCC', 60, 1, 1.0, 0.5), right='C')],
+            {'AAA': {'last': 99}, 'BBB': {'last': 60}, 'CCC': {'last': 50}},
+            account={'cash': 100000.0})
+        p = web.portfolio_summary(data['options_by_symbol'], {'cash': 100000.0},
+                                  today=date(2026, 9, 28))
+        assert p['put_exposure'] == 5 * 100 * 100 + 5 * 50 * 100
+        assert p['put_exposure_pct_of_cash'] == 75.0
+        week = p['expiring_week']
+        assert week['contracts'] == 10 and week['itm'] == 5
+        assert [i['symbol'] for i in week['items']] == ['CCC', 'AAA']
+        assert p['expiring_week_through'] == '2026-10-02'
+
+    def test_no_cash(self):
+        p = web.portfolio_summary({}, {}, has_options_data=False)
+        assert p['put_exposure_pct_of_cash'] is None and p['has_options_data'] is False
+
+
+class TestTranchesBasisFlag:
+    def test_api_marks_below_cost_lot(self, monkeypatch):
+        lot = {'id': 1, 'symbol': 'AAPL', 'qty': 100, 'opened_ts': '2026-01-01T00:00:00',
+               'open_price': 100.0, 'status': 'OPEN', 'premium': 200.0, 'realized_pl': None,
+               'covering_call': {'strike': 95.0, 'expiry': '2026-10-16'}, 'inferred': 0}
+        monkeypatch.setattr(web, 'rebuild_and_store_tranches', lambda: ([lot], []))
+        monkeypatch.setattr(web, '_current_prices', lambda: {'AAPL': 99.0})
+        web.state.db = FakeDB()
+        web.state.db.trade_count = lambda: 0
+        web.state.db.last_flex_import = lambda: None
+        web.state.db.get_setting = lambda key, default=None: default
+        with web.app.test_client() as c:
+            body = c.get('/api/tranches').get_json()
+        row = body['groups'][0]['open'][0]
+        assert row['call_basis_flag'] == 'loss' and row['call_basis_ref'] == 98.0

@@ -40,6 +40,37 @@ FIRST_PRICE_DEADLINE = 5  # seconds to wait for a new ticker's first price
 SNAPSHOT_MAX_AGE = 5      # seconds a snapshot stays fresh for coalescing
 
 
+ACCOUNT_TAGS = {
+    'NetLiquidation': 'net_liquidation',
+    'TotalCashValue': 'cash',
+    'AvailableFunds': 'available_funds',
+    'BuyingPower': 'buying_power',
+    'ExcessLiquidity': 'excess_liquidity',
+}
+
+
+def account_summary(account_values):
+    """Pick the handful of account balances the UI shows out of IBKR's
+    streamed account values (already subscribed by connectAsync for a
+    single-account login -- no extra request). Prefers USD, falls back to
+    the BASE-currency row. Missing tags are simply absent."""
+    picked = {}
+    for av in account_values or []:
+        key = ACCOUNT_TAGS.get(getattr(av, 'tag', None))
+        if not key:
+            continue
+        currency = getattr(av, 'currency', '')
+        if currency not in ('USD', 'BASE'):
+            continue
+        try:
+            value = float(av.value)
+        except (TypeError, ValueError):
+            continue
+        if key not in picked or currency == 'USD':
+            picked[key] = value
+    return picked
+
+
 def option_mark(ticker):
     """Best available per-share price for an option, plus where it came from.
 
@@ -47,7 +78,7 @@ def option_mark(ticker):
     'prev_close', or (None, None) when there is no quote at all.
 
     Why this isn't just marketPrice(): a nearly-worthless option (e.g. a far
-    OTM put on expiration day) usually has NO bid, so ib_insync's
+    OTM put on expiration day) usually has NO bid, so ib_async's
     hasBidAsk() is false, marketPrice() falls through to `last` (NaN when it
     hasn't traded today), and the old code coerced that to 0 -> "0% premium
     left" -> a BUYBACK alert driven purely by missing data, while a sibling
@@ -523,6 +554,7 @@ class IBKRManager:
                 'market_data': market_data,
                 'failed_symbols': failed_symbols,
                 'options': options,
+                'account': account_summary(self._ib.accountValues()),
             }
             self._last_snapshot = snapshot
             self._last_snapshot_time = time.time()

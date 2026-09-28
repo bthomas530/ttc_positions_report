@@ -3,7 +3,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from ttc_app.tranches import income_summary, rebuild_tranches
+from ttc_app.tranches import income_summary, option_open_dates, rebuild_tranches
 
 _id_counter = [0]
 
@@ -320,3 +320,33 @@ class TestIncomeSummary:
         unmet = income_summary(events, [], weekly_goal=500)
         assert unmet['weekly_streak'] == 0
         assert income_summary(events, [])['weekly_streak'] is None
+
+
+def _opt(ts, qty, strike=100.0, expiry='2026-10-16', right='P', symbol='AAPL'):
+    return {'sec_type': 'OPT', 'symbol': symbol, 'put_call': right, 'strike': strike,
+            'expiry': expiry, 'quantity': qty, 'trade_ts': ts}
+
+
+class TestOptionOpenDates:
+    def test_open_date_is_first_trade_from_flat(self):
+        dates = option_open_dates([
+            _opt('2026-09-01T10:00:00', -2),
+            _opt('2026-09-05T10:00:00', -3),   # add-on doesn't move the date
+        ])
+        assert dates[('AAPL', 'P', 100.0, '2026-10-16')] == '2026-09-01T10:00:00'
+
+    def test_full_close_resets(self):
+        dates = option_open_dates([
+            _opt('2026-09-01T10:00:00', -2),
+            _opt('2026-09-03T10:00:00', 2),
+            _opt('2026-09-10T10:00:00', -1),
+        ])
+        assert dates[('AAPL', 'P', 100.0, '2026-10-16')] == '2026-09-10T10:00:00'
+
+    def test_closed_series_absent_and_stock_ignored(self):
+        dates = option_open_dates([
+            _opt('2026-09-01T10:00:00', -2),
+            _opt('2026-09-03T10:00:00', 2),
+            {'sec_type': 'STK', 'symbol': 'AAPL', 'quantity': 100, 'trade_ts': '2026-09-01'},
+        ])
+        assert dates == {}

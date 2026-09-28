@@ -82,6 +82,8 @@
                 <div class="stat-card"><span class="stat-label">Gainers</span><span class="stat-value positive" id="statGainers">--</span></div>
                 <div class="stat-card"><span class="stat-label">Losers</span><span class="stat-value negative" id="statLosers">--</span></div>
                 <div class="stat-card"><span class="stat-label">Watchlist</span><span class="stat-value" id="statWatchlist">--</span></div>
+                <div class="stat-card" id="statPutExposureCard"><span class="stat-label">Put Assignment Exposure</span><span class="stat-value" id="statPutExposure">--</span><span class="stat-sub" id="statPutExposureSub"></span></div>
+                <div class="stat-card clickable" id="statExpiringCard"><span class="stat-label">Expiring This Week</span><span class="stat-value" id="statExpiring">--</span><span class="stat-sub" id="statExpiringSub"></span></div>
             </div>
             <nav class="tab-bar" id="tabBar">
                 <button class="tab-btn active" data-tab="positions" title="Positions (1)"><i class="fas fa-briefcase"></i> Positions</button>
@@ -219,6 +221,16 @@
                             <span class="form-hint">Short options are highlighted when their remaining premium falls to this percentage — e.g. 15 means "85% of the premium is already yours".</span>
                         </div>
                         <div class="form-row">
+                            <label for="assignmentWarnPct">Assignment warning distance (% from strike)</label>
+                            <input type="number" id="assignmentWarnPct" min="0" max="50" step="0.5">
+                            <span class="form-hint">A written option this close to its strike (or already in the money) gets a NEAR STRIKE / ITM badge and a notification. 0 = only warn once it's in the money.</span>
+                        </div>
+                        <div class="form-row">
+                            <label for="assignmentWarnDte">Assignment warning window (days to expiry)</label>
+                            <input type="number" id="assignmentWarnDte" min="0" max="365" step="1">
+                            <span class="form-hint">Only warn about contracts expiring within this many days.</span>
+                        </div>
+                        <div class="form-row">
                             <label for="weeklyGoal">Weekly premium goal ($)</label>
                             <input type="number" id="weeklyGoal" min="0" step="50">
                             <span class="form-hint">Shown on the Income tab. Set 0 to hide.</span>
@@ -255,6 +267,10 @@
                             <div class="checkbox-row">
                                 <input type="checkbox" id="notifActions">
                                 <label for="notifActions">Actions (save, export, import, update)</label>
+                            </div>
+                            <div class="checkbox-row">
+                                <input type="checkbox" id="notifAssignment">
+                                <label for="notifAssignment">Assignment risk (a written option goes near the strike or in the money — stays up until closed)</label>
                             </div>
                             <div class="checkbox-row">
                                 <input type="checkbox" id="notifErrors">

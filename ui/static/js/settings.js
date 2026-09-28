@@ -1,5 +1,10 @@
 // Settings tab: Flex Query setup, trading preferences, data export
 
+function numberOr(raw, fallback) {
+    const n = parseFloat(raw);
+    return Number.isFinite(n) ? n : fallback;
+}
+
 async function loadSettings() {
     try {
         const response = await fetch("/api/settings");
@@ -11,6 +16,8 @@ async function loadSettings() {
             ? "A token is saved (" + data.flex_token_masked + "). Paste a new one only to replace it."
             : "No token saved yet.";
         document.getElementById("buybackThreshold").value = data.buyback_threshold_pct;
+        document.getElementById("assignmentWarnPct").value = data.assignment_warn_pct;
+        document.getElementById("assignmentWarnDte").value = data.assignment_warn_dte;
         document.getElementById("weeklyGoal").value = data.weekly_premium_goal || 0;
         document.getElementById("monthlyGoal").value = data.monthly_premium_goal || 0;
 
@@ -129,6 +136,7 @@ function loadNotificationSettings() {
     document.getElementById("notifDataSource").checked = notif.categories.dataSource;
     document.getElementById("notifActions").checked = notif.categories.actions;
     document.getElementById("notifErrors").checked = notif.categories.errors;
+    document.getElementById("notifAssignment").checked = notif.categories.assignment;
     document.getElementById("notifRefresh").checked = notif.categories.refresh;
     document.getElementById("notifSubOptions").classList.toggle("disabled", !notif.enabled);
 }
@@ -154,6 +162,9 @@ document.addEventListener("DOMContentLoaded", () => {
     document.getElementById("notifErrors").addEventListener("change", (e) => {
         saveNotificationPrefs({ categories: { errors: e.target.checked } });
     });
+    document.getElementById("notifAssignment").addEventListener("change", (e) => {
+        saveNotificationPrefs({ categories: { assignment: e.target.checked } });
+    });
     document.getElementById("notifRefresh").addEventListener("change", (e) => {
         saveNotificationPrefs({ categories: { refresh: e.target.checked } });
     });
@@ -167,6 +178,9 @@ document.addEventListener("DOMContentLoaded", () => {
     document.getElementById("savePrefsBtn").addEventListener("click", () => {
         saveSettings({
             buyback_threshold_pct: parseFloat(document.getElementById("buybackThreshold").value) || 15,
+            // 0 is a valid choice for both, so no `|| default` here
+            assignment_warn_pct: numberOr(document.getElementById("assignmentWarnPct").value, 2),
+            assignment_warn_dte: numberOr(document.getElementById("assignmentWarnDte").value, 7),
             weekly_premium_goal: parseFloat(document.getElementById("weeklyGoal").value) || 0,
             monthly_premium_goal: parseFloat(document.getElementById("monthlyGoal").value) || 0,
         }, "Preferences saved");

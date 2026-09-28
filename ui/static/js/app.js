@@ -9,6 +9,10 @@ let currentSort = { positions: null, incomplete: null, watchlist: null };
 let refreshInterval;
 let cachedData = null;
 let optionsBySymbol = {};
+// Which Positions rows have their option sub-table open. Lives outside the
+// table so the periodic rebuild can re-apply it -- otherwise every
+// auto-refresh snapped every expanded row shut.
+const expandedOptionSymbols = new Set();
 let marketStatusInterval;
 let lastConnectionSource = null;
 const PREFS_KEY = "ttc_positions_prefs";
@@ -17,7 +21,7 @@ const loadedTabs = { positions: true };
 const DEFAULT_NOTIFICATION_PREFS = {
     enabled: true,
     position: "bottom-right",
-    categories: { refresh: false, dataSource: true, actions: true, errors: true },
+    categories: { refresh: false, dataSource: true, actions: true, errors: true, assignment: true },
 };
 
 // Single source of truth for columns across the three Positions-tab tables,
@@ -147,7 +151,7 @@ const COLUMN_HELP = {
     // ---- Positions / Incomplete Lots / Watchlist ----
     underlying: {
         what: "The stock this row is about. Click the ticker to open it on TradingView.",
-        note: "A number badge means this symbol has open option contracts — click the row to expand them.",
+        note: "A number badge means this symbol has open option contracts — click the row to expand them. Other badges: BUYBACK (a written option hit the buyback threshold), EXPIRES TODAY / EXPIRES · ITM (expiration day), ITM · 3d / NEAR · 3d (a written option is in the money or close to its strike, with days left), BELOW COST (a covered call's strike is under what the shares cost). Hover any badge for the details.",
     },
     shares: {
         what: "Shares of the stock currently held. Negative means a short stock position.",
@@ -223,15 +227,15 @@ const COLUMN_HELP = {
     },
     "opt.delta": {
         what: "Roughly how much the contract's price moves for a $1 move in the stock — and a rough stand-in for the odds of finishing in the money (0.30 ≈ 30%).",
-        calc: "IBKR's model greek. Blank when IBKR hasn't sent greeks for the contract yet.",
+        calc: "IBKR's model greek. When IBKR sends none (normal outside market hours), the app calculates it with Black-Scholes and marks it with a * — hover for which volatility it used.",
     },
     "opt.theta": {
         what: "Time decay — about what the contract loses in value per day, all else equal. On a written option that decay is working for you.",
-        calc: "IBKR's model greek, per share. Multiply by 100 for one contract.",
+        calc: "IBKR's model greek, per share. Multiply by 100 for one contract. A * means the app calculated it because IBKR sent none.",
     },
     "opt.iv": {
         what: "Implied volatility — how much movement the option's price implies, annualized. Higher IV means richer premium.",
-        calc: "IBKR's model implied volatility, shown as a percentage.",
+        calc: "IBKR's model implied volatility, shown as a percentage. A * means IBKR sent none: it's either the last IV IBKR reported for this contract, or one worked back from the Mark.",
     },
     "opt.entry": {
         what: "The price per share the contract was opened at — on a written option, the premium collected.",
@@ -248,6 +252,20 @@ const COLUMN_HELP = {
             + (cachedData && cachedData.buyback_threshold_pct ? cachedData.buyback_threshold_pct + "%" : "the threshold")
             + ", set under Settings → Trading Preferences.",
         note: "On expiration day the buyback alert is replaced by EXPIRES · OTM / EXPIRES · ITM — the only question that day is whether it gets assigned. Blank when IBKR has no quote for the contract.",
+    },
+
+    "opt.pl": {
+        what: "Profit or loss on this contract so far, in dollars, for the whole position.",
+        calc: "(Mark − Entry) × contracts × 100. On a written option: positive means it's cheaper to buy back now than what was collected.",
+        note: "Clearer than Prem. Left when a written option has moved against you — 855% left just means it costs 8.5× the premium to close; this shows what that actually is in dollars.",
+    },
+    "opt.yield": {
+        what: "The annualized return this written option was sold for — how hard the collateral is working.",
+        calc: "Entry ÷ Strike × 365 ÷ days from opening to expiry. The open date comes from the imported trade history; a * means it's not imported yet and the date the app first saw the position is used instead.",
+    },
+    "opt.yield_left": {
+        what: "The annualized return still left in this written option if held to expiry. When it's low, the collateral may earn more in a new trade.",
+        calc: "Mark ÷ Strike × 365 ÷ days to expiry (at least 1). Compare it to the Yield of a fresh trade you'd open instead.",
     },
 
     // ---- Tranches tab: open lots ----
@@ -283,6 +301,7 @@ const COLUMN_HELP = {
     "tranche.covering_call": {
         what: "The written call currently covering these shares, if there is one.",
         calc: "Shows the covering call's strike and expiry. When it's there, selling these shares would leave that call uncovered — hence the warning.",
+        note: "BELOW COST means assignment at that strike would sell this lot for less than it cost: red if it's below the net basis (a loss even after premium), amber if only below the purchase price.",
     },
 
     // ---- Tranches tab: closed lots ----
@@ -532,10 +551,41 @@ function showToast(message, type = "info", duration = 3000, category = "actions"
     const icons = { success: "fa-check-circle", error: "fa-exclamation-circle", info: "fa-info-circle" };
     toast.innerHTML = '<i class="fas ' + icons[type] + ' toast-icon"></i><span class="toast-message">' + message + '</span><button class="toast-close" onclick="this.parentElement.remove()"><i class="fas fa-times"></i></button>';
     container.appendChild(toast);
-    setTimeout(() => {
-        toast.style.animation = "slideOut 0.3s ease forwards";
-        setTimeout(() => toast.remove(), 300);
-    }, duration);
+    if (duration > 0) {  // 0 = stays until closed (for warnings worth acting on)
+        setTimeout(() => {
+            toast.style.animation = "slideOut 0.3s ease forwards";
+            setTimeout(() => toast.remove(), 300);
+        }, duration);
+    }
+}
+
+// conId -> the risk level last notified about. In memory on purpose: after a
+// restart Dad gets one fresh summary of what's currently at risk, then only
+// changes (a contract newly near the strike, or crossing into the money).
+const notifiedRisk = new Map();
+const RISK_RANK = { near: 1, itm: 2 };
+
+function notifyAssignmentRisk(data) {
+    const worsened = [];
+    Object.entries(data.options_by_symbol || {}).forEach(([symbol, opts]) => {
+        opts.forEach(o => {
+            if (!o.conId) return;
+            const level = o.expiring && o.itm ? "itm" : o.assignment_risk;
+            const prev = notifiedRisk.get(o.conId);
+            if (level && (RISK_RANK[level] || 0) > (RISK_RANK[prev] || 0)) {
+                worsened.push({ symbol, o, level });
+            }
+            if (level) notifiedRisk.set(o.conId, level); else notifiedRisk.delete(o.conId);
+        });
+    });
+    if (worsened.length === 0) return;
+    const lines = worsened.map(({ symbol, o, level }) =>
+        "<b>" + escapeHtml(symbol) + "</b> " + escapeHtml(contractLabel(o)) + " — " +
+        (level === "itm" ? "IN THE MONEY by " + Math.abs(o.cushion_pct || 0).toFixed(1) + "%"
+                         : "only " + Math.abs(o.cushion_pct || 0).toFixed(1) + "% from the strike") + ", " +
+        (o.dte <= 0 ? "expires today" : o.dte + "d left"));
+    const anyItm = worsened.some(w => w.level === "itm");
+    showToast("Assignment risk:<br>" + lines.join("<br>"), anyItm ? "error" : "info", 0, "assignment");
 }
 
 function updateMarketStatus() {
@@ -825,6 +875,15 @@ function exportToCSV() {
     showToast("Exported to CSV", "success");
 }
 
+// Shared by every tab (tranches.js/income.js load after this file).
+function fmtMoney(v, signed, digits) {
+    if (v === null || v === undefined) return "—";
+    const n = Number(v);
+    const d = digits === undefined ? 2 : digits;
+    const sign = signed && n > 0 ? "+" : "";
+    return sign + "$" + n.toLocaleString("en-US", { minimumFractionDigits: d, maximumFractionDigits: d });
+}
+
 function formatNumber(value, key) {
     if (value === "" || value === null || value === undefined) return "";
     const num = parseFloat(value);
@@ -1045,20 +1104,43 @@ function createTable(data, section) {
                     firstTd.appendChild(expBadge);
                 }
 
+                // Assignment risk before expiry day (expiry day is covered
+                // by the badge above).
+                const atRisk = opts.filter(o => o.assignment_risk && !o.expiring);
+                if (atRisk.length > 0) {
+                    const itm = atRisk.filter(o => o.assignment_risk === "itm");
+                    const soonest = Math.min(...atRisk.map(o => o.dte));
+                    const riskBadge = document.createElement("span");
+                    riskBadge.className = "expiry-badge collapsed-hint " + (itm.length ? "itm" : "near");
+                    riskBadge.textContent = (itm.length ? "ITM" : "NEAR") + " · " + soonest + "d";
+                    riskBadge.title = atRisk.map(riskDescription).join("\n");
+                    firstTd.appendChild(riskBadge);
+                }
+
+                const belowCost = opts.filter(o => o.basis_flag);
+                if (belowCost.length > 0) {
+                    const costBadge = document.createElement("span");
+                    const loss = belowCost.some(o => o.basis_flag === "loss");
+                    costBadge.className = "expiry-badge collapsed-hint " + (loss ? "itm" : "near");
+                    costBadge.textContent = "BELOW COST";
+                    costBadge.title = belowCost.map(basisDescription).join("\n");
+                    firstTd.appendChild(costBadge);
+                }
+
                 const expander = document.createElement("i");
                 expander.className = "fas fa-chevron-right opt-expander";
                 firstTd.appendChild(expander);
 
                 const detail = buildOptionDetailRow(symbol, opts, visibleCols.length);
-                detail.style.display = "none";
+                const startOpen = expandedOptionSymbols.has(symbol);
+                detail.style.display = startOpen ? "" : "none";
+                tr.classList.toggle("expanded", startOpen);
                 tbody.appendChild(detail);
 
                 firstTd.style.cursor = "pointer";
                 firstTd.addEventListener("click", (e) => {
                     if (e.target.closest("a")) return; // symbol link still works
-                    const open = detail.style.display !== "none";
-                    detail.style.display = open ? "none" : "";
-                    tr.classList.toggle("expanded", !open);
+                    setOptionRowExpanded(symbol, detail.style.display === "none");
                 });
             }
         }
@@ -1117,6 +1199,47 @@ function expiryDescription(o) {
         : head + " — out of the money by " + dist + und + ". On track to expire worthless.";
 }
 
+function setOptionRowExpanded(symbol, open) {
+    if (open) expandedOptionSymbols.add(symbol); else expandedOptionSymbols.delete(symbol);
+    const tr = document.querySelector('#positions-table tr.has-options[data-symbol="' + CSS.escape(symbol) + '"]');
+    const detail = document.querySelector('#positions-table tr.option-detail[data-parent="' + CSS.escape(symbol) + '"]');
+    if (!tr || !detail) return;
+    detail.style.display = open ? "" : "none";
+    tr.classList.toggle("expanded", open);
+}
+
+function contractLabel(o) {
+    return Math.abs(o.position || 0) + "× $" + Number(o.strike || 0).toFixed(2) + " " +
+        (o.right === "P" ? "put" : "call") + " " + (o.expiry || "");
+}
+
+function riskDescription(o) {
+    const dist = Math.abs(o.cushion_pct || 0).toFixed(1) + "%";
+    const und = o.und_price ? " (stock $" + Number(o.und_price).toFixed(2) + ")" : "";
+    return contractLabel(o) + ", " + o.dte + "d left — " + (o.assignment_risk === "itm"
+        ? "IN THE MONEY by " + dist + und + ". Assignment likely if it stays there; consider closing or rolling."
+        : "only " + dist + " from the strike" + und + ". Could go in the money before expiry.");
+}
+
+function basisDescription(o) {
+    const ref = "$" + Number(o.basis_ref || 0).toFixed(2);
+    const head = contractLabel(o) + ": if assigned, shares go at $" + Number(o.strike || 0).toFixed(2) + " — ";
+    if (o.basis_flag === "loss") return head + "below the covered lot's net cost of " + ref + " even after all premium. A real loss.";
+    if (o.basis_flag === "stock_loss") return head + "below the lot's purchase price of " + ref + ", but premium collected on it covers the gap.";
+    return head + "below the average cost of " + ref + " (no tranche data for this call — check the Tranches tab after the next trade import).";
+}
+
+// Shown (with a trailing *) when greeks weren't sent by IBKR -- see greeks.py.
+const IV_SOURCE_NOTES = {
+    last_known: "using the last IV IBKR reported for this contract",
+    implied: "using a volatility implied from the Mark",
+};
+
+function greeksNote(o) {
+    return "IBKR sent no greeks for this contract (normal outside market hours), so the app calculated them (Black-Scholes, " +
+        (IV_SOURCE_NOTES[o.iv_source] || "at expiry — delta is just in/out of the money") + "). Close enough to judge risk; not IBKR's number.";
+}
+
 function buildOptionDetailRow(symbol, opts, colspan) {
     const tr = document.createElement("tr");
     tr.className = "option-detail";
@@ -1130,7 +1253,9 @@ function buildOptionDetailRow(symbol, opts, colspan) {
         helpTh("DTE", "opt.dte") + helpTh("Delta", "opt.delta") +
         helpTh("Theta", "opt.theta") + helpTh("IV", "opt.iv") +
         helpTh("Entry", "opt.entry") + helpTh("Mark", "opt.mark") +
-        helpTh("Prem. Left", "opt.prem_left") + '<th></th></tr></thead><tbody>';
+        helpTh("Prem. Left", "opt.prem_left") + helpTh("P&L", "opt.pl") +
+        helpTh("Yield", "opt.yield") + helpTh("Yield Left", "opt.yield_left") +
+        '<th></th></tr></thead><tbody>';
     opts.forEach(o => {
         const short = (o.position || 0) < 0;
         const posClass = short ? "short-pos" : "long-pos";
@@ -1144,27 +1269,51 @@ function buildOptionDetailRow(symbol, opts, colspan) {
             : (MARK_SOURCE_NOTES[o.mark_source]
                 ? '<span class="mark-fallback" title="' + escapeHtml(MARK_SOURCE_NOTES[o.mark_source]) + '">$' + fmt(o.mark, 2) + '*</span>'
                 : '$' + fmt(o.mark, 2));
-        let flag = "";
+        const flags = [];
         if (o.buyback_target_hit) {
-            flag = '<span class="buyback-badge">BUYBACK TARGET</span>';
+            flags.push('<span class="buyback-badge">BUYBACK TARGET</span>');
         } else if (o.expiring && short) {
             const cls = o.itm ? "itm" : (o.itm === false ? "otm" : "unknown");
             const label = o.itm ? "EXPIRES · ITM" : (o.itm === false ? "EXPIRES · OTM" : "EXPIRES TODAY");
-            flag = '<span class="expiry-badge ' + cls + '" title="' + escapeHtml(expiryDescription(o)) + '">' + label + '</span>';
+            flags.push('<span class="expiry-badge ' + cls + '" title="' + escapeHtml(expiryDescription(o)) + '">' + label + '</span>');
         }
+        if (o.assignment_risk && !o.expiring) {
+            flags.push('<span class="expiry-badge ' + (o.assignment_risk === "itm" ? "itm" : "near") + '" title="' +
+                escapeHtml(riskDescription(o)) + '">' + (o.assignment_risk === "itm" ? "ITM" : "NEAR STRIKE") + '</span>');
+        }
+        if (o.basis_flag) {
+            flags.push('<span class="expiry-badge ' + (o.basis_flag === "loss" ? "itm" : "near") + '" title="' +
+                escapeHtml(basisDescription(o)) + '">BELOW COST</span>');
+        }
+        const calc = o.greeks_source === "calc";
+        const greek = (v, digits) => (v === null || v === undefined) ? "—"
+            : (calc ? '<span class="mark-fallback" title="' + escapeHtml(greeksNote(o)) + '">' + Number(v).toFixed(digits) + '*</span>'
+                    : Number(v).toFixed(digits));
+        const ivText = o.iv ? (o.iv * 100).toFixed(0) + "%" : "—";
+        const ivCell = (o.iv && calc) ? '<span class="mark-fallback" title="' + escapeHtml(greeksNote(o)) + '">' + ivText + '*</span>' : ivText;
+        const plCell = (o.unrealized_pl === null || o.unrealized_pl === undefined) ? "—"
+            : '<span class="' + (o.unrealized_pl >= 0 ? "positive" : "negative") + '">' + fmtMoney(o.unrealized_pl, true, 0) + '</span>';
+        const pct = v => (v === null || v === undefined) ? "—" : Number(v).toFixed(1) + "%";
+        const yieldCell = (o.yield_ann !== null && o.yield_ann !== undefined && o.open_date_source === "first_seen")
+            ? '<span class="mark-fallback" title="Open date not in the imported trade history yet — using ' +
+              escapeHtml(o.open_date) + ', when this app first saw the position.">' + pct(o.yield_ann) + '*</span>'
+            : pct(o.yield_ann);
         html += '<tr class="' + rowClass + '">' +
             '<td>' + escapeHtml((o.right === "P" ? "PUT" : "CALL")) + '</td>' +
             '<td class="' + posClass + '">' + escapeHtml(o.position) + '</td>' +
             '<td>$' + fmt(o.strike, 2) + '</td>' +
             '<td>' + escapeHtml(o.expiry || "—") + '</td>' +
             '<td>' + escapeHtml(o.dte !== null && o.dte !== undefined ? o.dte + "d" : "—") + '</td>' +
-            '<td>' + fmt(o.delta, 2) + '</td>' +
-            '<td>' + fmt(o.theta, 2) + '</td>' +
-            '<td>' + (o.iv ? (o.iv * 100).toFixed(0) + "%" : "—") + '</td>' +
+            '<td>' + greek(o.delta, 2) + '</td>' +
+            '<td>' + greek(o.theta, 2) + '</td>' +
+            '<td>' + ivCell + '</td>' +
             '<td>$' + fmt(o.entry_price, 2) + '</td>' +
             '<td>' + markCell + '</td>' +
             '<td>' + premLeft + '</td>' +
-            '<td>' + flag + '</td>' +
+            '<td>' + plCell + '</td>' +
+            '<td>' + yieldCell + '</td>' +
+            '<td>' + pct(o.yield_left_ann) + '</td>' +
+            '<td class="opt-flags">' + flags.join(" ") + '</td>' +
             '</tr>';
     });
     html += '</tbody></table>';
@@ -1297,6 +1446,60 @@ function updateSummaryStats(data) {
     plEl.className = "stat-value " + (dailyPL >= 0 ? "positive" : "negative");
 }
 
+// Put exposure = what it would cost to buy the shares if every written put
+// were assigned at once, against the account's cash.
+function updatePortfolioCards(portfolio) {
+    const expEl = document.getElementById("statPutExposure");
+    const expSub = document.getElementById("statPutExposureSub");
+    const expCard = document.getElementById("statPutExposureCard");
+    const weekEl = document.getElementById("statExpiring");
+    const weekSub = document.getElementById("statExpiringSub");
+    const weekCard = document.getElementById("statExpiringCard");
+    if (!portfolio || !portfolio.has_options_data) {
+        expEl.textContent = "--"; expSub.textContent = "needs IBKR"; expEl.className = "stat-value";
+        weekEl.textContent = "--"; weekSub.textContent = "needs IBKR"; weekEl.className = "stat-value";
+        expCard.title = weekCard.title = "Option positions only come from IBKR — shown once it's connected.";
+        return;
+    }
+    expEl.textContent = fmtMoney(portfolio.put_exposure, false, 0);
+    const pct = portfolio.put_exposure_pct_of_cash;
+    if (pct === null || pct === undefined) {
+        expSub.textContent = portfolio.cash === null || portfolio.cash === undefined ? "cash unavailable" : "no cash";
+        expEl.className = "stat-value";
+    } else {
+        expSub.textContent = pct.toFixed(0) + "% of " + fmtMoney(portfolio.cash, false, 0) + " cash";
+        expEl.className = "stat-value " + (pct > 100 ? "negative" : "");
+    }
+    expCard.title = "Sum of strike × 100 × contracts across every written put — the cash needed if all were assigned." +
+        (portfolio.cash !== null && portfolio.cash !== undefined ? "\nCash (IBKR TotalCashValue): " + fmtMoney(portfolio.cash, false, 0) : "") +
+        (portfolio.available_funds !== null && portfolio.available_funds !== undefined ? "\nAvailable funds: " + fmtMoney(portfolio.available_funds, false, 0) : "") +
+        (portfolio.net_liquidation !== null && portfolio.net_liquidation !== undefined ? "\nNet liquidation: " + fmtMoney(portfolio.net_liquidation, false, 0) : "");
+
+    const week = portfolio.expiring_week || { contracts: 0, itm: 0, items: [] };
+    weekEl.textContent = week.contracts;
+    weekEl.className = "stat-value " + (week.itm > 0 ? "negative" : "");
+    weekSub.textContent = week.contracts === 0 ? "nothing through Fri"
+        : (week.itm > 0 ? week.itm + " ITM" : "all OTM") + (week.at_risk > week.itm ? " · " + (week.at_risk - week.itm) + " near" : "");
+    weekCard.title = week.items.length === 0
+        ? "No written options expire through " + portfolio.expiring_week_through + "."
+        : "Written options expiring through " + portfolio.expiring_week_through + " — click to expand them:\n" +
+          week.items.map(i => i.symbol + " " + Math.abs(i.position) + "× $" + Number(i.strike).toFixed(2) + " " +
+              (i.right === "P" ? "put" : "call") + " · " + i.dte + "d · " +
+              (i.itm === null || i.itm === undefined ? "?" : (i.itm ? "ITM " : "OTM ") + Math.abs(i.cushion_pct || 0).toFixed(1) + "%")).join("\n");
+    weekCard.dataset.symbols = JSON.stringify([...new Set(week.items.map(i => i.symbol))]);
+}
+
+function expandExpiringThisWeek() {
+    let symbols = [];
+    try { symbols = JSON.parse(document.getElementById("statExpiringCard").dataset.symbols || "[]"); } catch (e) {}
+    if (symbols.length === 0) return;
+    switchTab("positions");
+    if (document.getElementById("positions-section").classList.contains("collapsed")) toggleSection("positions");
+    symbols.forEach(sym => setOptionRowExpanded(sym, true));
+    const first = document.querySelector('#positions-table tr.has-options[data-symbol="' + CSS.escape(symbols[0]) + '"]');
+    if (first) first.scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
 function updateSectionCounts(data) {
     document.getElementById("positions-count").textContent = data.positions.length;
     document.getElementById("incomplete-count").textContent = data.incomplete_lots.length;
@@ -1423,6 +1626,8 @@ async function updateTables() {
         
         updateLastUpdateTime();
         updateSummaryStats(data);
+        updatePortfolioCards(data.portfolio);
+        notifyAssignmentRisk(data);
         updateSectionCounts(data);
         updateConnectionStatus(data);
         
@@ -1575,6 +1780,7 @@ document.addEventListener("DOMContentLoaded", () => {
         if (e.target === document.getElementById("columns-modal")) closeColumnsModal();
     });
     document.getElementById("columnsResetBtn").addEventListener("click", resetColumnsToDefault);
+    document.getElementById("statExpiringCard").addEventListener("click", expandExpiringThisWeek);
 
     initTabs();
 

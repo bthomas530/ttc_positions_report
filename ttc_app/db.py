@@ -444,6 +444,43 @@ class Database:
             self._conn.execute('DELETE FROM option_snapshots WHERE ts < ?', (cutoff,))
         return inserted
 
+    def latest_option_ivs(self, conids):
+        """{conid: iv} from the most recent snapshot where IBKR actually sent
+        an IV -- the vol to reuse when it sends no greeks (pre-market)."""
+        result = {}
+        with self._lock:
+            for conid in conids:
+                row = self._conn.execute(
+                    'SELECT iv FROM option_snapshots WHERE conid = ? AND iv > 0 '
+                    'ORDER BY ts DESC LIMIT 1', (conid,)).fetchone()
+                if row:
+                    result[conid] = row[0]
+        return result
+
+    def option_first_seen(self, conids):
+        """{conid: earliest snapshot ts} -- when this app first saw the
+        position. Stand-in open date until the Flex import has the trade.
+
+        Only returned when the app was already recording OTHER options at
+        least a day before this one showed up. Otherwise (fresh install, or
+        history pruned by retention) "first seen" just means "first time the
+        app looked", which would make a months-old position look opened
+        today and wildly inflate its annualized yield."""
+        result = {}
+        with self._lock:
+            earliest = self._conn.execute(
+                'SELECT MIN(ts) FROM option_snapshots').fetchone()[0]
+            if not earliest:
+                return result
+            cutoff = (datetime.fromisoformat(earliest) + timedelta(days=1)).isoformat()
+            for conid in conids:
+                row = self._conn.execute(
+                    'SELECT MIN(ts) FROM option_snapshots WHERE conid = ?',
+                    (conid,)).fetchone()
+                if row and row[0] and row[0] > cutoff:
+                    result[conid] = row[0]
+        return result
+
     # ---------- flex imports ----------
 
     def record_flex_import(self, reference_code, trade_count, new_count, status, error=None):

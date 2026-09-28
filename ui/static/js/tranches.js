@@ -1,12 +1,5 @@
 // Tranches tab: per-lot wheel tracking rendered from /api/tranches
 
-function fmtMoney(v, signed) {
-    if (v === null || v === undefined) return "—";
-    const n = Number(v);
-    const sign = signed && n > 0 ? "+" : "";
-    return sign + "$" + n.toFixed(2);
-}
-
 function fmtDate(iso) {
     if (!iso) return "—";
     try {
@@ -73,6 +66,13 @@ function renderTranches(data) {
                 coverCell = '<span class="badge covered">CALL $' + Number(t.covering_call.strike || 0).toFixed(2)
                     + ' ' + escapeHtml(t.covering_call.expiry || '') + '</span>'
                     + ' <span class="badge uncover-warn" title="Selling these shares would leave this written call uncovered"><i class="fas fa-triangle-exclamation"></i> DON’T SELL SHARES</span>';
+                if (t.call_basis_flag) {
+                    const loss = t.call_basis_flag === "loss";
+                    const tip = "If assigned, this lot sells at $" + Number(t.covering_call.strike || 0).toFixed(2) + " — below its " +
+                        (loss ? "net basis of $" : "purchase price of $") + Number(t.call_basis_ref || 0).toFixed(2) +
+                        (loss ? ", a loss even after premium." : ", but premium collected covers the gap.");
+                    coverCell += ' <span class="badge ' + (loss ? "uncover-warn" : "seeded") + '" title="' + escapeHtml(tip) + '">BELOW COST</span>';
+                }
             }
             const plClass = (t.unrealized_pl || 0) >= 0 ? "positive" : "negative";
             return '<tr>' +

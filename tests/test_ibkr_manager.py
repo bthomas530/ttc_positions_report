@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from ttc_app.ibkr_manager import (
+    account_summary,
     BACKOFF_CAP,
     IBKRManager,
     classify_handshake_error,
@@ -57,22 +58,22 @@ class TestSafePrice:
 
 
 class FakeTicker:
-    """Minimal stand-in for ib_insync.Ticker with the real marketPrice() rules."""
+    """Minimal stand-in for ib_async.Ticker with the real marketPrice() rules."""
     def __init__(self, bid=math.nan, ask=math.nan, last=math.nan, close=math.nan,
                  bidSize=0, askSize=0):
         self.bid, self.ask, self.last, self.close = bid, ask, last, close
         self.bidSize, self.askSize = bidSize, askSize
 
     def marketPrice(self):
-        from ib_insync import Ticker
+        from ib_async import Ticker
         return Ticker.marketPrice(self)
 
     def hasBidAsk(self):
-        from ib_insync import Ticker
+        from ib_async import Ticker
         return Ticker.hasBidAsk(self)
 
     def midpoint(self):
-        from ib_insync import Ticker
+        from ib_async import Ticker
         return Ticker.midpoint(self)
 
 
@@ -153,3 +154,20 @@ class TestManagerStatus:
 
     def test_retry_in_seconds_without_schedule(self):
         assert IBKRManager().retry_in_seconds() == 0
+
+
+class TestAccountSummary:
+    def test_prefers_usd_and_skips_junk(self):
+        from types import SimpleNamespace as AV
+        values = [
+            AV(tag='TotalCashValue', value='1000', currency='BASE'),
+            AV(tag='TotalCashValue', value='900', currency='USD'),
+            AV(tag='NetLiquidation', value='5000', currency='BASE'),
+            AV(tag='AvailableFunds', value='oops', currency='USD'),
+            AV(tag='TotalCashValue', value='7', currency='EUR'),
+            AV(tag='SomethingElse', value='1', currency='USD'),
+        ]
+        assert account_summary(values) == {'cash': 900.0, 'net_liquidation': 5000.0}
+
+    def test_empty(self):
+        assert account_summary(None) == {}

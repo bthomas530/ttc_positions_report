@@ -410,6 +410,28 @@ class _Engine:
         })
 
 
+def option_open_dates(trades):
+    """{(symbol, right, strike, expiry): ts} of when each currently-open
+    option position was opened: the trade that took the net contract count
+    for that series from zero to non-zero. A later add-on to an open
+    position doesn't move the date; a full close resets it."""
+    net = {}
+    opened = {}
+    for trade in trades:
+        if trade.get('sec_type') != 'OPT':
+            continue
+        key = (trade['symbol'], trade.get('put_call'),
+               trade.get('strike'), trade.get('expiry'))
+        before = net.get(key, 0)
+        after = before + (trade.get('quantity') or 0)
+        if before == 0 and after != 0:
+            opened[key] = trade.get('trade_ts')
+        elif after == 0:
+            opened.pop(key, None)
+        net[key] = after
+    return opened
+
+
 def rebuild_tranches(trades, current_positions=None):
     """Rebuild all tranches and events from trades (chronological order).
 
