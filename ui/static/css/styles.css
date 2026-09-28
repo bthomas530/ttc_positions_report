@@ -24,6 +24,14 @@ tr.option-detail>td{padding:0 0 0 32px;background:var(--bg-primary)}
 .option-subtable tr.buyback-hit td{background:var(--positive-bg)}
 .buyback-badge{background:var(--positive);color:#fff;border-radius:4px;padding:2px 7px;font-size:10px;font-weight:700;font-family:var(--font-sans);white-space:nowrap}
 .buyback-badge.collapsed-hint{margin-left:6px;vertical-align:middle}
+.expiry-badge{border-radius:4px;padding:2px 7px;font-size:10px;font-weight:700;font-family:var(--font-sans);white-space:nowrap;cursor:help}
+.expiry-badge.otm{background:var(--bg-tertiary);color:var(--text-secondary);border:1px solid var(--border-color)}
+.expiry-badge.unknown{background:var(--warning-bg);color:var(--warning)}
+.expiry-badge.itm{background:var(--negative);color:#fff}
+.expiry-badge.collapsed-hint{margin-left:6px;vertical-align:middle}
+.option-subtable tr.expiring td{background:var(--bg-tertiary)}
+.option-subtable tr.expiring-itm td{background:var(--negative-bg)}
+.mark-fallback{cursor:help;opacity:.8;font-style:italic}
 .short-pos{color:var(--negative);font-weight:600}
 .long-pos{color:var(--positive);font-weight:600}
 

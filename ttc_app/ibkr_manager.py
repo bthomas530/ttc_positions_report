@@ -40,6 +40,39 @@ FIRST_PRICE_DEADLINE = 5  # seconds to wait for a new ticker's first price
 SNAPSHOT_MAX_AGE = 5      # seconds a snapshot stays fresh for coalescing
 
 
+def option_mark(ticker):
+    """Best available per-share price for an option, plus where it came from.
+
+    Returns (mark, source) with source in 'live' | 'ask' | 'last' |
+    'prev_close', or (None, None) when there is no quote at all.
+
+    Why this isn't just marketPrice(): a nearly-worthless option (e.g. a far
+    OTM put on expiration day) usually has NO bid, so ib_insync's
+    hasBidAsk() is false, marketPrice() falls through to `last` (NaN when it
+    hasn't traded today), and the old code coerced that to 0 -> "0% premium
+    left" -> a BUYBACK alert driven purely by missing data, while a sibling
+    contract that happened to have a stale prev close showed none. The ask
+    is the real cost to buy back a short when there's no bid, so it comes
+    before last/close; and "no quote" stays None rather than posing as $0.
+    """
+    # marketPrice() quietly returns `last` when there's no two-sided quote,
+    # so only trust it as "live" when a real bid and ask exist.
+    if ticker.hasBidAsk():
+        price = safe_price(ticker.marketPrice())
+        if price > 0:
+            return price, 'live'
+    ask = safe_price(ticker.ask)
+    if ask > 0 and safe_price(ticker.askSize) > 0:
+        return ask, 'ask'
+    last = safe_price(ticker.last)
+    if last > 0:
+        return last, 'last'
+    close = safe_price(ticker.close)
+    if close > 0:
+        return close, 'prev_close'
+    return None, None
+
+
 class IBKRUnavailableError(Exception):
     """Base class for IBKR connection failures classified by root cause."""
     verdict = 'unknown'
@@ -571,9 +604,7 @@ class IBKRManager:
                 except ValueError:
                     pass
             multiplier = safe_price(contract.multiplier) or 100
-            mark = safe_price(ticker.marketPrice())
-            if mark <= 0:
-                mark = safe_price(ticker.last) or safe_price(ticker.close)
+            mark, mark_source = option_mark(ticker)
             options.append({
                 'conId': conid,
                 'symbol': contract.symbol,
@@ -586,6 +617,7 @@ class IBKRManager:
                 'multiplier': multiplier,
                 'entry_price': (info['avgCost'] / multiplier) if multiplier else 0,
                 'mark': mark,
+                'mark_source': mark_source,
                 'delta': safe_price(greeks.delta) if greeks else None,
                 'gamma': safe_price(greeks.gamma) if greeks else None,
                 'theta': safe_price(greeks.theta) if greeks else None,

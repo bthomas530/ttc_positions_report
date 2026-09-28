@@ -2,6 +2,8 @@ import asyncio
 import math
 import os
 import sys
+
+import pytest
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -11,6 +13,7 @@ from ttc_app.ibkr_manager import (
     IBKRManager,
     classify_handshake_error,
     compute_backoff,
+    option_mark,
     probe_ib_ports,
     safe_price,
 )
@@ -51,6 +54,44 @@ class TestSafePrice:
     def test_valid(self):
         assert safe_price(42.5) == 42.5
         assert safe_price('13.25') == 13.25
+
+
+class FakeTicker:
+    """Minimal stand-in for ib_insync.Ticker with the real marketPrice() rules."""
+    def __init__(self, bid=math.nan, ask=math.nan, last=math.nan, close=math.nan,
+                 bidSize=0, askSize=0):
+        self.bid, self.ask, self.last, self.close = bid, ask, last, close
+        self.bidSize, self.askSize = bidSize, askSize
+
+    def marketPrice(self):
+        from ib_insync import Ticker
+        return Ticker.marketPrice(self)
+
+    def hasBidAsk(self):
+        from ib_insync import Ticker
+        return Ticker.hasBidAsk(self)
+
+    def midpoint(self):
+        from ib_insync import Ticker
+        return Ticker.midpoint(self)
+
+
+class TestOptionMark:
+    def test_live_midpoint(self):
+        assert option_mark(FakeTicker(bid=0.10, ask=0.20, bidSize=5, askSize=5)) == (
+            pytest.approx(0.15), 'live')
+
+    def test_no_bid_uses_ask(self):
+        # Nearly worthless expiring put: no bid, penny ask, never traded today.
+        assert option_mark(FakeTicker(bid=-1, ask=0.01, askSize=10)) == (0.01, 'ask')
+
+    def test_falls_back_to_last_then_close(self):
+        assert option_mark(FakeTicker(last=0.03)) == (0.03, 'last')
+        assert option_mark(FakeTicker(close=0.02)) == (0.02, 'prev_close')
+
+    def test_no_quote_is_none_not_zero(self):
+        # The original bug: this came back as 0 -> "0% left" -> BUYBACK.
+        assert option_mark(FakeTicker()) == (None, None)
 
 
 class TestProbe:

@@ -240,13 +240,14 @@ const COLUMN_HELP = {
     "opt.mark": {
         what: "What the contract is worth right now, per share. On a written option that's roughly what it would cost to buy it back and close the trade.",
         calc: "IBKR's market price for the contract — the midpoint of bid/ask during the session, falling back to the last trade, then the previous close. Multiply by 100 for dollars to close one contract.",
-        note: "Entry is what came in when it was sold; Mark is what it would cost to get out today. The gap between them is the profit so far.",
+        note: "A * after the mark means there was no live bid/ask (common for nearly worthless contracts) — hover it to see whether it's the ask, last trade, or previous close. — means no quote at all. Entry is what came in when it was sold; Mark is what it would cost to get out today. The gap between them is the profit so far.",
     },
     "opt.prem_left": {
         what: "How much of the premium is still at risk on a written option. 20% left means 80% of the premium has already been earned.",
         calc: () => "Mark ÷ Entry × 100. The row turns amber with a BUYBACK TARGET badge at or below "
             + (cachedData && cachedData.buyback_threshold_pct ? cachedData.buyback_threshold_pct + "%" : "the threshold")
             + ", set under Settings → Trading Preferences.",
+        note: "On expiration day the buyback alert is replaced by EXPIRES · OTM / EXPIRES · ITM — the only question that day is whether it gets assigned. Blank when IBKR has no quote for the contract.",
     },
 
     // ---- Tranches tab: open lots ----
@@ -1030,6 +1031,20 @@ function createTable(data, section) {
                     firstTd.appendChild(buybackBadge);
                 }
 
+                // Expiry-day shorts get their own badge on every such symbol --
+                // red if any is in the money (assignment risk), neutral if all
+                // are out of the money and should just expire.
+                const expiring = opts.filter(o => o.expiring && (o.position || 0) < 0);
+                if (expiring.length > 0) {
+                    const anyItm = expiring.some(o => o.itm === true);
+                    const unknown = expiring.some(o => o.itm === null || o.itm === undefined);
+                    const expBadge = document.createElement("span");
+                    expBadge.className = "expiry-badge collapsed-hint " + (anyItm ? "itm" : (unknown ? "unknown" : "otm"));
+                    expBadge.textContent = anyItm ? "EXPIRES · ITM" : "EXPIRES TODAY";
+                    expBadge.title = expiring.map(expiryDescription).join("\n");
+                    firstTd.appendChild(expBadge);
+                }
+
                 const expander = document.createElement("i");
                 expander.className = "fas fa-chevron-right opt-expander";
                 firstTd.appendChild(expander);
@@ -1082,6 +1097,26 @@ function startColumnResize(e, section, key, table) {
     document.addEventListener("mouseup", onUp);
 }
 
+// Shown (with a trailing *) when an option's mark isn't a live bid/ask
+// price -- see option_mark() in ibkr_manager.py.
+const MARK_SOURCE_NOTES = {
+    ask: "No bid for this contract — showing the ask, which is what it would cost to buy back.",
+    last: "No live bid/ask — showing the last trade.",
+    prev_close: "No live quote — showing the previous close, which may be stale.",
+};
+
+function expiryDescription(o) {
+    const kind = o.right === "P" ? "put" : "call";
+    const head = Math.abs(o.position || 0) + "× $" + Number(o.strike || 0).toFixed(2) + " " + kind +
+        (o.dte < 0 ? " is past expiry and hasn't cleared yet" : " expires today");
+    if (o.itm === null || o.itm === undefined) return head + " — stock price unavailable, check moneyness manually.";
+    const dist = Math.abs(o.cushion_pct || 0).toFixed(1) + "%";
+    const und = o.und_price ? " (stock $" + Number(o.und_price).toFixed(2) + ")" : "";
+    return o.itm
+        ? head + " — IN THE MONEY by " + dist + und + ". Likely assignment unless closed or rolled."
+        : head + " — out of the money by " + dist + und + ". On track to expire worthless.";
+}
+
 function buildOptionDetailRow(symbol, opts, colspan) {
     const tr = document.createElement("tr");
     tr.className = "option-detail";
@@ -1102,7 +1137,22 @@ function buildOptionDetailRow(symbol, opts, colspan) {
         const premLeft = (o.premium_remaining_pct === null || o.premium_remaining_pct === undefined)
             ? "—" : o.premium_remaining_pct.toFixed(0) + "%";
         const fmt = (v, digits) => (v === null || v === undefined) ? "—" : Number(v).toFixed(digits);
-        html += '<tr class="' + (o.buyback_target_hit ? "buyback-hit" : "") + '">' +
+        const rowClass = o.buyback_target_hit ? "buyback-hit"
+            : (o.expiring && short ? (o.itm ? "expiring-itm" : "expiring") : "");
+        const markCell = (o.mark === null || o.mark === undefined)
+            ? '<span title="No quote from IBKR for this contract">—</span>'
+            : (MARK_SOURCE_NOTES[o.mark_source]
+                ? '<span class="mark-fallback" title="' + escapeHtml(MARK_SOURCE_NOTES[o.mark_source]) + '">$' + fmt(o.mark, 2) + '*</span>'
+                : '$' + fmt(o.mark, 2));
+        let flag = "";
+        if (o.buyback_target_hit) {
+            flag = '<span class="buyback-badge">BUYBACK TARGET</span>';
+        } else if (o.expiring && short) {
+            const cls = o.itm ? "itm" : (o.itm === false ? "otm" : "unknown");
+            const label = o.itm ? "EXPIRES · ITM" : (o.itm === false ? "EXPIRES · OTM" : "EXPIRES TODAY");
+            flag = '<span class="expiry-badge ' + cls + '" title="' + escapeHtml(expiryDescription(o)) + '">' + label + '</span>';
+        }
+        html += '<tr class="' + rowClass + '">' +
             '<td>' + escapeHtml((o.right === "P" ? "PUT" : "CALL")) + '</td>' +
             '<td class="' + posClass + '">' + escapeHtml(o.position) + '</td>' +
             '<td>$' + fmt(o.strike, 2) + '</td>' +
@@ -1112,9 +1162,9 @@ function buildOptionDetailRow(symbol, opts, colspan) {
             '<td>' + fmt(o.theta, 2) + '</td>' +
             '<td>' + (o.iv ? (o.iv * 100).toFixed(0) + "%" : "—") + '</td>' +
             '<td>$' + fmt(o.entry_price, 2) + '</td>' +
-            '<td>$' + fmt(o.mark, 2) + '</td>' +
+            '<td>' + markCell + '</td>' +
             '<td>' + premLeft + '</td>' +
-            '<td>' + (o.buyback_target_hit ? '<span class="buyback-badge">BUYBACK TARGET</span>' : '') + '</td>' +
+            '<td>' + flag + '</td>' +
             '</tr>';
     });
     html += '</tbody></table>';

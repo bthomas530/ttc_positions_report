@@ -418,30 +418,61 @@ def enhance_with_market_data(basic_data):
     threshold = buyback_threshold_pct()
     options_by_symbol = {}
     for opt in basic_data.get('options', []):
+        symbol = opt.get('symbol')
         entry = safe_number(opt.get('entry_price'))
-        mark = safe_number(opt.get('mark'))
+        # None = no quote at all. Must stay distinct from a real $0.00 mark:
+        # coercing it to 0 read as "0% premium left" and fired a bogus
+        # BUYBACK on one expiring put while its siblings stayed silent.
+        raw_mark = opt.get('mark')
+        mark = safe_number(raw_mark) if raw_mark is not None else None
         premium_remaining_pct = None
-        if entry > 0 and mark >= 0:
+        if entry > 0 and mark is not None:
             premium_remaining_pct = round(100 * mark / entry, 1)
+        position = opt.get('position') or 0
+        dte = opt.get('dte')
+        # Expiring today (or past expiry but not yet cleared by IBKR).
+        expiring = dte is not None and dte <= 0
+        strike = safe_number(opt.get('strike'))
+        und_price = (safe_number(market_data.get(symbol, {}).get('last'))
+                     or safe_number(opt.get('und_price')))
+        itm = None
+        cushion_pct = None
+        if und_price > 0 and strike > 0:
+            if opt.get('right') == 'P':
+                itm = und_price < strike
+                cushion_pct = round(100 * (und_price - strike) / und_price, 2)
+            elif opt.get('right') == 'C':
+                itm = und_price > strike
+                cushion_pct = round(100 * (strike - und_price) / und_price, 2)
         row = {
             'localSymbol': opt.get('localSymbol'),
             'right': opt.get('right'),
             'strike': opt.get('strike'),
             'expiry': opt.get('expiry'),
-            'dte': opt.get('dte'),
+            'dte': dte,
             'position': opt.get('position'),
             'entry_price': round(entry, 4),
-            'mark': round(mark, 4),
+            'mark': round(mark, 4) if mark is not None else None,
+            'mark_source': opt.get('mark_source'),
             'premium_remaining_pct': premium_remaining_pct,
+            # Not on expiry day: the buyback threshold is the "lock in the
+            # profit early and redeploy" signal. On expiry day the question
+            # is only ITM vs OTM, which `expiring` + `itm` answer for every
+            # short contract consistently.
             'buyback_target_hit': bool(
-                opt.get('position', 0) < 0
+                position < 0
+                and not expiring
                 and premium_remaining_pct is not None
                 and premium_remaining_pct <= threshold),
+            'expiring': bool(expiring and position != 0),
+            'itm': itm,
+            'cushion_pct': cushion_pct,
+            'und_price': und_price or None,
             'delta': opt.get('delta'),
             'theta': opt.get('theta'),
             'iv': opt.get('iv'),
         }
-        options_by_symbol.setdefault(opt.get('symbol'), []).append(row)
+        options_by_symbol.setdefault(symbol, []).append(row)
     for rows in options_by_symbol.values():
         rows.sort(key=lambda r: (r.get('expiry') or '', r.get('strike') or 0))
 
