@@ -61,24 +61,16 @@ class TestSafePrice:
         assert safe_price('13.25') == 13.25
 
 
-class FakeTicker:
-    """Minimal stand-in for ib_async.Ticker with the real marketPrice() rules."""
-    def __init__(self, bid=math.nan, ask=math.nan, last=math.nan, close=math.nan,
-                 bidSize=0, askSize=0):
-        self.bid, self.ask, self.last, self.close = bid, ask, last, close
-        self.bidSize, self.askSize = bidSize, askSize
-
-    def marketPrice(self):
-        from ib_async import Ticker
-        return Ticker.marketPrice(self)
-
-    def hasBidAsk(self):
-        from ib_async import Ticker
-        return Ticker.hasBidAsk(self)
-
-    def midpoint(self):
-        from ib_async import Ticker
-        return Ticker.midpoint(self)
+def FakeTicker(**fields):
+    """A real ib_async Ticker with the given quote fields. Fields are set
+    after construction because Ticker.__post_init__ resets them to "unset"
+    (ib_async 2.x) -- and using the real class means option_mark() is
+    tested against the library's actual hasBidAsk()/marketPrice() rules."""
+    from ib_async import Ticker
+    ticker = Ticker()
+    for name, value in fields.items():
+        setattr(ticker, name, value)
+    return ticker
 
 
 class TestOptionMark:
